@@ -1,0 +1,98 @@
+/* ============================================================
+   EVE-COOK 全局 QSS 样式 —— 深色科技风
+   ------------------------------------------------------------
+   QSS（Qt Style Sheets）类似网页的 CSS，
+   用来统一控制 Qt 控件的颜色、边框、字体等外观。
+
+   主题色约定（与 utils/constants.py 保持一致）：
+   - 背景色：#0a0e14（深蓝黑）
+   - 主色：  #00d4aa（青绿）
+   ============================================================ */
+
+/* ---- 全局窗口背景与默认文字 ---- */
+QMainWindow, QWidget {
+    background-color: #0a0e14;
+    color: #c5c8c6;
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+
+/* ---- 选项卡控件 ---- */
+QTabWidget::pane {
+    border: 1px solid #1f2733;      /* 选项卡内容区边框 */
+    background-color: #0d1219;
+}
+QTabBar::tab {
+    background-color: #0d1219;
+    color: #8a9199;
+    padding: 8px 18px;              /* 内边距让点击区域更大 */
+    border: 1px solid #1f2733;
+    border-bottom: none;
+}
+QTabBar::tab:selected {
+    background-color: #0a0e14;
+    color: #00d4aa;                 /* 选中标签用主色高亮 */
+    border-bottom: 2px solid #00d4aa;
+}
+
+/* ---- 按钮 ---- */
+QPushButton {
+    background-color: #12202b;
+    color: #00d4aa;
+    border: 1px solid #00d4aa;
+    border-radius: 4px;             /* 圆角，更有科技感 */
+    padding: 6px 16px;
+}
+QPushButton:hover {
+    background-color: #1a3040;      /* 鼠标悬停时加深背景 */
+}
+QPushButton:pressed {
+    background-color: #00d4aa;      /* 按下时反色 */
+    color: #0a0e14;
+}
+QPushButton:disabled {
+    background-color: #1f2733;      /* 禁用态置灰 */
+    color: #555b63;
+    border-color: #555b63;
+}
+
+/* ---- 日志显示区（QPlainTextEdit） ---- */
+QPlainTextEdit {
+    background-color: #0d1219;
+    color: #c5c8c6;
+    border: 1px solid #1f2733;
+    font-family: "Consolas", "Microsoft YaHei", monospace;  /* 等宽字体更易读 */
+    font-size: 12px;
+}
+
+/* ---- 输入框 ---- */
+QLineEdit {
+    background-color: #0d1219;
+    color: #c5c8c6;
+    border: 1px solid #1f2733;
+    border-radius: 3px;
+    padding: 5px 8px;
+}
+QLineEdit:focus {
+    border-color: #00d4aa;          /* 聚焦时边框变主色 */
+}
+
+/* ---- 状态栏 ---- */
+QStatusBar {
+    background-color: #0d1219;
+    color: #8a9199;
+}
+
+/* ---- 滚动条（深色细条风格） ---- */
+QScrollBar:vertical {
+    background-color: #0a0e14;
+    width: 10px;
+}
+QScrollBar::handle:vertical {
+    background-color: #1f2733;
+    border-radius: 5px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #00d4aa;      /* 悬停时滑块变主色 */
+}
