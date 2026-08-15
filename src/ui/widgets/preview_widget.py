@@ -37,8 +37,10 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from core import window_capture
 from core.window_capture import capture_window
 from core.window_enumerator import WindowInfo
+from utils.constants import EVE_WINDOW_CLASSES
 from utils.logger import get_logger
 
 logger = get_logger("preview_widget")
@@ -68,6 +70,8 @@ class PreviewWidget(QWidget):
         self._drag_start: Optional[QPoint] = None  # 鼠标按下点（控件坐标系）
         self._drag_end: Optional[QPoint] = None    # 鼠标当前点（控件坐标系）
         self._dragging: bool = False
+        # "框选模式"标志：开启后会在画布顶部显示提示文字、鼠标切为十字形
+        self._roi_select_mode: bool = False
 
         self._build_ui()
 
@@ -79,7 +83,7 @@ class PreviewWidget(QWidget):
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(6)
 
-        # ---- 顶部工具条：窗口下拉 + 刷新 + 清除ROI ----
+        # ---- 顶部工具条：窗口下拉 + 刷新 + 开始框选区域 + 清除ROI ----
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
@@ -94,6 +98,13 @@ class PreviewWidget(QWidget):
         self.btn_refresh.setObjectName("previewRefreshBtn")
         self.btn_refresh.clicked.connect(self.refresh_preview)
         toolbar.addWidget(self.btn_refresh)
+
+        # 显式"开始框选无人机区域"按钮：用户一眼就能找到；并提供强视觉反馈。
+        self.btn_start_roi = QPushButton("开始框选无人机区域", self)
+        self.btn_start_roi.setObjectName("previewStartRoiBtn")
+        self.btn_start_roi.setCheckable(True)
+        self.btn_start_roi.toggled.connect(self._on_roi_mode_toggled)
+        toolbar.addWidget(self.btn_start_roi)
 
         self.btn_clear_roi = QPushButton("清除区域", self)
         self.btn_clear_roi.setObjectName("previewClearRoiBtn")
@@ -111,7 +122,25 @@ class PreviewWidget(QWidget):
         self.canvas.sig_drag_started.connect(self._on_drag_started)
         self.canvas.sig_drag_moved.connect(self._on_drag_moved)
         self.canvas.sig_drag_finished.connect(self._on_drag_finished)
+        # 画布也显示当前是否进入"框选模式"（顶部一条提示条）
+        self.canvas.set_roi_select_mode(self._roi_select_mode)
         outer.addWidget(self.canvas, stretch=1)
+
+        # ---- 底部：操作提示条 + 状态标签 ----
+        self.lbl_help = QLabel(
+            "操作提示：① 选择目标 EVE 窗口 → ② 点『刷新预览』获取画面 "
+            "→ ③ 点『开始框选无人机区域』后，在画面上按住鼠标左键拖一个矩形，即可锁定无人机面板。",
+            self,
+        )
+        self.lbl_help.setObjectName("previewHelpLabel")
+        self.lbl_help.setWordWrap(True)
+        self.lbl_help.setStyleSheet(
+            "QLabel#previewHelpLabel {"
+            "  color: #889298;"
+            "  padding: 2px 2px 0px 2px;"
+            "}"
+        )
+        outer.addWidget(self.lbl_help)
 
         # ---- 底部：状态标签（坐标 / 尺寸） ----
         self.lbl_status = QLabel("暂无预览。请先在上方选择目标窗口，然后点『刷新预览』。", self)
@@ -123,9 +152,26 @@ class PreviewWidget(QWidget):
     #  对外 API
     # ============================================================
     def set_windows(self, windows: List[WindowInfo]) -> None:
-        """把最新枚举的 EVE 窗口填充到下拉列表，保留当前选中项。"""
+        """
+        把最新枚举的 EVE 窗口填充到下拉列表。
+
+        选中策略：
+            1. 之前选中的 hwnd 仍存在于新列表中 → 保留选中项（稳定不变）。
+            2. 之前选中的 hwnd 在新列表里不存在，但窗口列表非空
+               → 自动选第一个窗口（让预览立即有内容，避免停在"未选中"导致刷新看起来无效）。
+            3. 新窗口列表为空 → 保持"未选中"。
+
+        额外副作用（安全）：
+            - 把窗口捕获模块的"类白名单"固定为 EVE_WINDOW_CLASSES，防止误截非游戏窗口。
+            - 把窗口捕获模块的"句柄白名单"设置为本次传入的 windows.hwnd 集合，
+              从而即使 combo userData 被外部改坏，也绝不截别的窗口。
+        """
         self._windows = list(windows)
         current_hwnd = self._target_hwnd
+
+        # ---- 白名单同步（安全：禁止误截到非游戏窗口） ----
+        window_capture.set_allowed_window_classes(EVE_WINDOW_CLASSES)
+        window_capture.set_allowed_hwnds([w.hwnd for w in self._windows])
 
         self.combo_windows.blockSignals(True)
         try:
@@ -134,15 +180,51 @@ class PreviewWidget(QWidget):
             for w in self._windows:
                 label = f"{w.character_name or w.title}  (PID {w.pid}, 句柄 0x{w.hwnd:X})"
                 self.combo_windows.addItem(label, userData=w.hwnd)
-            # 尝试恢复之前选中的 hwnd
-            idx = self.combo_windows.findData(current_hwnd)
-            if idx >= 0:
-                self.combo_windows.setCurrentIndex(idx)
+
+            # ---------- 选中策略 ----------
+            # 注意：previous_hwnd==0 表示"此前从未选中过真实 EVE 窗口"，
+            # 此时不要用 findData(0) 去找（否则会命中第 0 项"未选中"而被当作"找到 previous"）。
+            if current_hwnd != 0:
+                idx_previous = self.combo_windows.findData(current_hwnd)
+                if idx_previous >= 0:
+                    # 策略 (1)：之前的 hwnd 还在列表中 → 保留
+                    self.combo_windows.setCurrentIndex(idx_previous)
+                elif self._windows:
+                    # 策略 (2)：之前的 hwnd 不在了，但列表非空 → 默认第一个
+                    self.combo_windows.setCurrentIndex(1)
+                else:
+                    # 策略 (3)：列表为空 → 未选中
+                    self.combo_windows.setCurrentIndex(0)
             else:
-                self.combo_windows.setCurrentIndex(0)
-                self._target_hwnd = 0
+                # previous_hwnd == 0：要么没选过，要么上次选的是空
+                if self._windows:
+                    # 策略 (2)：直接默认选第一个 → 画面立即出现，避免"刷新不了"错觉
+                    self.combo_windows.setCurrentIndex(1)
+                else:
+                    # 策略 (3)：没 EVE 窗口 → 保持未选中
+                    self.combo_windows.setCurrentIndex(0)
         finally:
             self.combo_windows.blockSignals(False)
+
+        # 在解除信号阻塞后，显式同步一次 _target_hwnd 并立即刷新预览（如果选项有效）
+        raw_data = self.combo_windows.currentData()
+        if raw_data is None:
+            final_hwnd = 0
+        else:
+            try:
+                final_hwnd = int(raw_data)
+            except (TypeError, ValueError):
+                final_hwnd = 0
+        if final_hwnd != self._target_hwnd:
+            self._target_hwnd = final_hwnd
+            self.sig_target_changed.emit(self._target_hwnd)
+        if final_hwnd != 0:
+            self.refresh_preview()
+        else:
+            # 目标为空：清掉旧缓存，避免"显示非游戏窗口"错觉
+            self._full_pixmap = None
+            self.canvas.set_content(None)
+            self._refresh_display_state_label()
 
     def set_target_hwnd(self, hwnd: int) -> None:
         """编程方式选中某个目标窗口；不存在则回到『未选中』。"""
@@ -206,8 +288,56 @@ class PreviewWidget(QWidget):
         self._dragging = False
         self.canvas.set_roi(None)
         self.canvas.set_drag_rect(None)
+        # 清除区域时顺便退出"框选模式"（用户已经主动清了，不需要继续框选）
+        if self.btn_start_roi.isChecked():
+            self.btn_start_roi.blockSignals(True)
+            try:
+                self.btn_start_roi.setChecked(False)
+            finally:
+                self.btn_start_roi.blockSignals(False)
+            self._set_roi_select_mode(False)
         self.sig_roi_changed.emit(None)
         self._refresh_display_state_label()
+
+    # ============================================================
+    #  框选模式：显式按钮驱动 + 自动退出
+    # ============================================================
+    def request_start_roi_select(self) -> None:
+        """编程方式触发"开始框选无人机区域"（等价于点按钮）。"""
+        if not self.btn_start_roi.isChecked():
+            self.btn_start_roi.setChecked(True)
+
+    def _on_roi_mode_toggled(self, checked: bool) -> None:
+        """按钮切换到"框选模式"时的视觉反馈与状态同步。"""
+        self._set_roi_select_mode(bool(checked))
+        if checked:
+            # 没图就不允许框选模式，弹提示并自动退出
+            if self._full_pixmap is None or self._full_pixmap.isNull():
+                self._set_status(
+                    "请先选择目标窗口并『刷新预览』，待画面出现后再开始框选无人机区域。",
+                    warn=True,
+                )
+                self.sig_preview_failed.emit("未获取预览图，无法开始框选无人机区域")
+                self.btn_start_roi.blockSignals(True)
+                try:
+                    self.btn_start_roi.setChecked(False)
+                finally:
+                    self.btn_start_roi.blockSignals(False)
+                self._set_roi_select_mode(False)
+                return
+            self._set_status("【框选模式】已开启：在画面上按住鼠标左键拖一个矩形，即可锁定无人机面板。松开鼠标完成。")
+        else:
+            self._refresh_display_state_label()
+
+    def _set_roi_select_mode(self, enabled: bool) -> None:
+        self._roi_select_mode = bool(enabled)
+        self.canvas.set_roi_select_mode(self._roi_select_mode)
+        # 鼠标光标的视觉反馈
+        from PyQt5.QtGui import QCursor
+        from PyQt5.QtCore import Qt
+        self.canvas.setCursor(
+            QCursor(Qt.CrossCursor if self._roi_select_mode else Qt.ArrowCursor)
+        )
 
     # ============================================================
     #  内部槽：下拉切换 / 鼠标拖拽三段事件
@@ -250,6 +380,7 @@ class PreviewWidget(QWidget):
         # 太小的拖拽视为无效（防止鼠标抖动误画）
         if widget_rect is None or widget_rect.width() < 6 or widget_rect.height() < 6:
             self.canvas.set_roi(self._roi_window)  # 还原上一次有效 ROI
+            # 无效就不要自动退出框选模式，用户可能只是没拖准
             return
 
         # 把控件坐标系的矩形 -> 真实窗口客户区的矩形
@@ -261,6 +392,16 @@ class PreviewWidget(QWidget):
         self._roi_window = roi
         self.canvas.set_roi(roi)
         self.sig_roi_changed.emit(roi)
+
+        # 画完一个有效 ROI 后自动退出"框选模式"，减少用户的"结束操作"心理负担
+        if self.btn_start_roi.isChecked():
+            self.btn_start_roi.blockSignals(True)
+            try:
+                self.btn_start_roi.setChecked(False)
+            finally:
+                self.btn_start_roi.blockSignals(False)
+            self._set_roi_select_mode(False)
+
         self._refresh_display_state_label()
 
     # ============================================================
@@ -368,6 +509,7 @@ class _PreviewCanvas(QWidget):
         self._display_rect: QRect = QRect()
         self._roi: Optional[RoiRect] = None
         self._drag_rect: Optional[QRect] = None
+        self._roi_select_mode: bool = False  # 是否处于"框选模式"（顶部提示条用）
         self.setMouseTracking(True)
         self.setMinimumSize(480, 300)
         # 设置一个有边框风格，让用户明显知道这是预览区
@@ -391,6 +533,13 @@ class _PreviewCanvas(QWidget):
         self._drag_rect = rect
         self.update()
 
+    def set_roi_select_mode(self, enabled: bool) -> None:
+        """切换"框选模式"视觉提示（顶部一条高亮说明）。"""
+        if bool(enabled) == self._roi_select_mode:
+            return
+        self._roi_select_mode = bool(enabled)
+        self.update()
+
     def display_rect(self) -> Optional[QRect]:
         """返回当前图像在本控件中的显示矩形（用于坐标换算），无效时返回 None。"""
         if not self._display_rect.isValid():
@@ -410,8 +559,8 @@ class _PreviewCanvas(QWidget):
                 p.setPen(QColor("#555b63"))
                 p.drawText(self.rect(), Qt.AlignCenter,
                            "（此处显示 EVE 窗口画面预览）\n"
-                           "选择窗口后点『刷新预览』；\n"
-                           "然后在画面上拖拽鼠标框选无人机监控区域。")
+                           "① 选择目标 EVE 窗口 → ② 点『刷新预览』\n"
+                           "③ 点『开始框选无人机区域』后在画面上拖拽鼠标。")
                 return
 
             # 计算"保持比例居中"的显示矩形
@@ -453,6 +602,20 @@ class _PreviewCanvas(QWidget):
                 p.setPen(pen)
                 p.setBrush(QColor(255, 209, 102, 35))  # 半透明琥珀色
                 p.drawRect(self._drag_rect)
+
+            # ---- 框选模式：顶部高亮说明条（叠加在画面最上层） ----
+            if self._roi_select_mode:
+                banner_h = 34
+                banner_rect = QRect(0, 0, self.width(), banner_h)
+                p.fillRect(banner_rect, QColor(0, 212, 170, 55))  # 青绿半透明
+                pen = QPen(QColor("#00d4aa"))
+                pen.setWidth(1)
+                p.setPen(pen)
+                p.drawLine(0, banner_h - 1, self.width(), banner_h - 1)
+                text_rect = banner_rect.adjusted(10, 0, -10, 0)
+                p.setPen(QColor("#ffffff"))
+                p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
+                           "✦ 框选模式：按住鼠标左键在画面上拖拽一个矩形 → 松开即完成无人机区域选择")
 
         finally:
             p.end()
