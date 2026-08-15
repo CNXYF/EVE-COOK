@@ -178,6 +178,8 @@ def main() -> None:
     #     并按顺序 ("EVE-COOK", "频道翻译", "跳数计算") 添加到 QTabWidget，
     #     这里只需把各服务引用 + 配置引用传入，供其连接信号用。
     #   - 保持 monitor_tab / jump_tab / translate_tab 依赖的服务先创建完毕。
+    #   - 同时把 log_watcher 传入，便于主窗口把"频道白名单"配置同步到
+    #     LogWatcher.set_channel_whitelist，让过滤即时生效（无需重启）。
     window = MainWindow(
         service_manager=service_manager,
         local_service=local_service,
@@ -188,6 +190,7 @@ def main() -> None:
         config=config,
         audio_manager=audio_manager,
         alert_overlay=None,  # None 表示让 MainWindow 内部自行创建 AlertOverlay
+        log_watcher=log_watcher,  # 日志监视器：用于同步"监控频道白名单"
     )
     window.show()
 

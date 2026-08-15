@@ -21,7 +21,7 @@
 """
 import threading
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Set
 
 from watchdog.events import (
     FileCreatedEvent,
@@ -105,6 +105,43 @@ class LogWatcher:
         self._lock = threading.Lock()                     # 🔒 保护订阅者列表
         # 记录每个文件已读到的字节位置，下次只读"新增部分"
         self._file_positions: dict = {}
+        # 频道白名单：为空集合时表示"不过滤，监控所有频道"
+        # 非空时，只有文件名以"白名单频道名_"开头的日志才会被广播
+        self._channel_whitelist: Set[str] = set()
+
+    def set_channel_whitelist(self, channels: Set[str]) -> None:
+        """
+        设置频道白名单。
+
+        参数：
+            channels: 频道名集合；空集合 = 不过滤（监控所有频道）；
+                      非空 = 只处理文件名以"频道名_"开头的日志。
+        """
+        with self._lock:
+            self._channel_whitelist = {ch.strip() for ch in channels if ch.strip()}
+        if self._channel_whitelist:
+            logger.info(f"频道白名单已设置：{sorted(self._channel_whitelist)}")
+        else:
+            logger.info("频道白名单已清空（监控所有频道）")
+
+    def _is_channel_allowed(self, file_path: Path) -> bool:
+        """
+        检查日志文件是否属于白名单频道。
+
+        EVE 日志文件名格式：频道名_日期_时间_监听者ID.txt
+        匹配规则：文件名以"频道名_"开头即算命中（兼容频道名含下划线的情况）。
+
+        返回：
+            True = 允许处理；False = 应跳过。
+        """
+        # 白名单为空 = 不过滤
+        if not self._channel_whitelist:
+            return True
+        filename = file_path.name
+        for channel in self._channel_whitelist:
+            if filename.startswith(channel + "_"):
+                return True
+        return False
 
     def subscribe(self, callback: LogLineCallback) -> None:
         """
@@ -167,6 +204,10 @@ class LogWatcher:
         因此字节偏移天然是偶数对齐的，按字节位置增量读取是安全的。
         """
         try:
+            # 频道白名单过滤：不在白名单内的频道直接跳过
+            if not self._is_channel_allowed(file_path):
+                return
+
             # 以二进制模式打开，用字节偏移定位最可靠（避免编码干扰）
             with open(file_path, "rb") as f:
                 last_pos = self._file_positions.get(file_path, 0)

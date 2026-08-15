@@ -25,7 +25,7 @@
 import io
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import QPoint, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox,
@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
 
 from core import window_capture
 from core.window_capture import capture_window
-from core.window_enumerator import WindowInfo
+from core.window_enumerator import WindowEnumerator, WindowInfo
 from utils.constants import EVE_WINDOW_CLASSES
 from utils.logger import get_logger
 
@@ -73,7 +73,26 @@ class PreviewWidget(QWidget):
         # "框选模式"标志：开启后会在画布顶部显示提示文字、鼠标切为十字形
         self._roi_select_mode: bool = False
 
+        # ---- 窗口枚举器（用于定时重新扫描，清理已关闭的窗口） ----
+        self._enumerator = WindowEnumerator()
+
+        # ---- 定时器：实时预览刷新 ----
+        self._timer_preview = QTimer(self)
+        self._timer_preview.setInterval(2000)  # 每 2 秒刷新一次预览画面
+        self._timer_preview.timeout.connect(self._on_preview_tick)
+        self._live_preview_enabled: bool = True  # 默认开启实时预览
+
+        # ---- 定时器：定时重新枚举窗口，清理已关闭的 ----
+        self._timer_rescan = QTimer(self)
+        self._timer_rescan.setInterval(5000)  # 每 5 秒重新扫描一次窗口列表
+        self._timer_rescan.timeout.connect(self._on_rescan_tick)
+
         self._build_ui()
+
+        # ---- 启动定时器 ----
+        if self._live_preview_enabled:
+            self._timer_preview.start()
+        self._timer_rescan.start()
 
     # ============================================================
     #  界面构建
@@ -98,6 +117,14 @@ class PreviewWidget(QWidget):
         self.btn_refresh.setObjectName("previewRefreshBtn")
         self.btn_refresh.clicked.connect(self.refresh_preview)
         toolbar.addWidget(self.btn_refresh)
+
+        # "实时预览"开关：开启后每 2 秒自动截图刷新，关闭后需手动点"刷新预览"
+        self.btn_live = QPushButton("实时预览", self)
+        self.btn_live.setObjectName("previewLiveBtn")
+        self.btn_live.setCheckable(True)
+        self.btn_live.setChecked(self._live_preview_enabled)
+        self.btn_live.toggled.connect(self._on_live_toggled)
+        toolbar.addWidget(self.btn_live)
 
         # 显式"开始框选无人机区域"按钮：用户一眼就能找到；并提供强视觉反馈。
         self.btn_start_roi = QPushButton("开始框选无人机区域", self)
@@ -338,6 +365,62 @@ class PreviewWidget(QWidget):
         self.canvas.setCursor(
             QCursor(Qt.CrossCursor if self._roi_select_mode else Qt.ArrowCursor)
         )
+
+    # ============================================================
+    #  定时器回调：实时预览 + 窗口列表刷新
+    # ============================================================
+    def _on_live_toggled(self, checked: bool) -> None:
+        """「实时预览」开关切换。"""
+        self._live_preview_enabled = bool(checked)
+        if checked:
+            self._timer_preview.start()
+            self._refresh_display_state_label()
+        else:
+            self._timer_preview.stop()
+            self._refresh_display_state_label()
+
+    def _on_preview_tick(self) -> None:
+        """定时器触发：刷新预览画面（拖拽中暂停，避免画面跳变干扰框选）。"""
+        if self._dragging or self._roi_select_mode:
+            return  # 正在框选 ROI 时暂停自动刷新
+        if self._target_hwnd == 0:
+            return  # 没有选中目标窗口，不刷
+        self.refresh_preview()
+
+    def _on_rescan_tick(self) -> None:
+        """
+        定时器触发：重新枚举 EVE 窗口，清理已关闭的窗口。
+
+        策略：
+          - 重新调用 WindowEnumerator.enumerate_eve_windows()
+          - 对比新旧列表：如果窗口集合完全相同，什么都不做（避免无意义的 combo 刷新）
+          - 如果有变化（新增/消失），调用 set_windows 更新下拉
+          - 如果当前选中的 hwnd 已不在新列表中，自动切换到第一个可用窗口
+        """
+        try:
+            fresh = self._enumerator.enumerate_eve_windows()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"定时重新枚举窗口失败：{e}")
+            return
+
+        old_hwnds = {w.hwnd for w in self._windows}
+        new_hwnds = {w.hwnd for w in fresh}
+
+        # 窗口集合完全相同 → 无需更新
+        if old_hwnds == new_hwnds:
+            return
+
+        # 有变化：检查当前选中的 hwnd 是否仍然有效
+        current_still_valid = self._target_hwnd in new_hwnds
+
+        # 调用 set_windows 更新下拉（会自动保留当前选中项或切换到第一个）
+        self.set_windows(fresh)
+
+        # 如果当前选中的窗口已关闭且 set_windows 没能自动切换，补一次日志
+        if not current_still_valid and self._target_hwnd != 0:
+            logger.info(f"目标窗口 0x{self._target_hwnd:X} 已关闭，已自动切换")
+        elif not current_still_valid and self._target_hwnd == 0 and fresh:
+            logger.info("原目标窗口已关闭，已自动切换到第一个可用窗口")
 
     # ============================================================
     #  内部槽：下拉切换 / 鼠标拖拽三段事件

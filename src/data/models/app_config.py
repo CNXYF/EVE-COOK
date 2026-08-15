@@ -81,6 +81,7 @@ class MonitorConfig:
     enable_voice: bool = True                                     # 是否开启语音
     hostile_list: List[str] = field(default_factory=list)         # 敌对角色名列表
     translation_channels: List[str] = field(default_factory=list) # 需要翻译的频道名
+    monitored_channels: List[str] = field(default_factory=list)   # 监控频道白名单（空=监控所有）
     drone: DroneConfig = field(default_factory=DroneConfig)       # 无人机子配置
     alert: AlertConfig = field(default_factory=AlertConfig)       # 预警子配置
 

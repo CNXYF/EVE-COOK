@@ -19,6 +19,7 @@ from PyQt5.QtCore import pyqtSlot
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
 
 from core.audio_manager import AudioManager
+from core.log_watcher import LogWatcher
 from core.window_enumerator import WindowEnumerator
 from data.config_manager import ConfigManager
 from data.models.app_config import AppConfig
@@ -53,6 +54,7 @@ class MainWindow(QMainWindow):
         config: Optional[AppConfig] = None,
         audio_manager: Optional[AudioManager] = None,
         alert_overlay: Optional[AlertOverlay] = None,
+        log_watcher: Optional[LogWatcher] = None,
     ):
         """
         参数：
@@ -65,6 +67,7 @@ class MainWindow(QMainWindow):
             config:             应用配置对象（读初始配置 & 运行时更新）。
             audio_manager:      音频管理器（预留）。
             alert_overlay:      外部注入的悬浮预警窗（为 None 则内部创建）。
+            log_watcher:        日志监视器（用于把"监控频道白名单"实时同步到过滤层）。
         """
         super().__init__()
         # ---- 服务与依赖引用 ----
@@ -76,6 +79,7 @@ class MainWindow(QMainWindow):
         self._config_manager = config_manager
         self._config = config
         self._audio_manager = audio_manager
+        self._log_watcher = log_watcher  # 日志监视器：UI 白名单变更时即时下发到过滤层
         self._window_enumerator = WindowEnumerator()  # 用于扫描 EVE 窗口
 
         # 窗口基础属性
@@ -111,6 +115,16 @@ class MainWindow(QMainWindow):
                 self._drone_service.set_drone_roi(
                     tuple(drone_cfg.roi_rect) if drone_cfg.roi_rect is not None else None
                 )
+
+        # ---- 初始化监控频道白名单（从配置恢复 + 同步到 LogWatcher）----
+        # 说明：set_monitored_channels 内部用 blockSignals 保护，
+        #       不会触发 sig_monitored_channels_changed 信号，
+        #       因此必须手动把白名单下发到 LogWatcher 的过滤层。
+        if self._config is not None:
+            channels = list(self._config.monitor.monitored_channels)
+            self._monitor_tab.set_monitored_channels(channels)
+            if self._log_watcher is not None:
+                self._log_watcher.set_channel_whitelist(set(channels))
 
     def _build_ui(self) -> None:
         """
@@ -170,6 +184,13 @@ class MainWindow(QMainWindow):
 
         # 新版信号：监控配置变更
         self._monitor_tab.sig_config_changed.connect(self._on_monitor_config_changed)
+
+        # 新增：监控频道白名单变更 -> 同步 LogWatcher + 持久化配置
+        # 🔒 线程安全说明：LogWatcher.set_channel_whitelist 内部已加锁，
+        #    可在主线程中安全调用。
+        self._monitor_tab.sig_monitored_channels_changed.connect(
+            self._on_monitored_channels_changed
+        )
 
         # 新增：预览区"目标窗口"变化 + "无人机 ROI"变化 -> 服务 + 配置持久化
         self._monitor_tab.sig_target_window_changed.connect(self._on_target_window_changed)
@@ -451,6 +472,40 @@ class MainWindow(QMainWindow):
         desc = "、".join(new_channels) if new_channels else "全部频道"
         self._monitor_tab.append_log(
             "INFO", f"翻译频道白名单已更新：{desc}"
+        )
+
+    @pyqtSlot(list)
+    def _on_monitored_channels_changed(self, channels: list) -> None:
+        """
+        监控频道白名单变更：写入配置 + 即时下发到 LogWatcher 过滤层。
+
+        参数：
+            channels: 新的白名单频道名列表（空列表 = 监控所有频道）。
+
+        说明：
+            - UI 侧的 set_monitored_channels 用 blockSignals 保护，
+              恢复配置时不会触发本槽；只有用户主动增删/勾选时才触发。
+            - LogWatcher.set_channel_whitelist 内部已加锁，
+              即使 LogWatcher 已在 watchdog 后台线程中广播日志，
+              也能安全切换白名单，下一行日志即按新规则过滤。
+        """
+        if self._config is None:
+            return
+
+        new_channels = list(channels) if channels else []
+        # 配置持久化（仅在变化时写盘，避免无谓 IO）
+        if self._config.monitor.monitored_channels != new_channels:
+            self._config.monitor.monitored_channels = new_channels
+            if self._config_manager is not None:
+                self._config_manager.save(self._config)
+
+        # 即时下发到 LogWatcher（启动前后均生效）
+        if self._log_watcher is not None:
+            self._log_watcher.set_channel_whitelist(set(new_channels))
+
+        desc = "、".join(new_channels) if new_channels else "全部频道"
+        self._monitor_tab.append_log(
+            "INFO", f"监控频道白名单已更新：{desc}"
         )
 
     # ============================================================

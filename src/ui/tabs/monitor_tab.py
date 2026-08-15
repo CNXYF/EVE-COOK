@@ -28,6 +28,8 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -75,6 +77,7 @@ class MonitorTab(QWidget):
     sig_config_changed = pyqtSignal(dict)
     sig_target_window_changed = pyqtSignal(int)  # 预览区选择的目标窗口变更 (hwnd)
     sig_drone_roi_changed = pyqtSignal(object)    # 无人机 ROI 区域变更 ((L,T,R,B) 或 None)
+    sig_monitored_channels_changed = pyqtSignal(list)  # 监控频道白名单变化
 
     def __init__(self, parent=None):
         """构建监控中心页界面。"""
@@ -202,6 +205,45 @@ class MonitorTab(QWidget):
 
         layout.addWidget(switch_group)
 
+        # ---- 监控频道白名单 ----
+        ch_group = QGroupBox("监控频道白名单", panel)
+        ch_group.setObjectName("channelWhitelistGroupBox")
+        ch_layout = QVBoxLayout(ch_group)
+        ch_layout.setContentsMargins(4, 4, 4, 4)
+        ch_layout.setSpacing(4)
+
+        # 输入行：频道名 + 添加按钮
+        ch_input_row = QHBoxLayout()
+        ch_input_row.setSpacing(4)
+        self.line_channel_input = QLineEdit(ch_group)
+        self.line_channel_input.setObjectName("line_channel_input")
+        self.line_channel_input.setPlaceholderText("输入频道名，如 Local / Intel")
+        ch_input_row.addWidget(self.line_channel_input, stretch=1)
+
+        self.btn_add_channel = QPushButton("添加", ch_group)
+        self.btn_add_channel.setObjectName("btn_add_channel")
+        ch_input_row.addWidget(self.btn_add_channel)
+        ch_layout.addLayout(ch_input_row)
+
+        # 频道列表（每行带复选框）
+        self.list_channels = QListWidget(ch_group)
+        self.list_channels.setObjectName("list_channels")
+        self.list_channels.setMaximumHeight(100)
+        ch_layout.addWidget(self.list_channels)
+
+        # 删除按钮
+        self.btn_remove_channel = QPushButton("删除选中频道", ch_group)
+        self.btn_remove_channel.setObjectName("btn_remove_channel")
+        ch_layout.addWidget(self.btn_remove_channel)
+
+        # 说明文字
+        ch_hint = QLabel("勾选的频道日志才会被处理；未勾选或未添加的频道将被忽略。", ch_group)
+        ch_hint.setWordWrap(True)
+        ch_hint.setStyleSheet("QLabel { color: #889298; font-size: 11px; }")
+        ch_layout.addWidget(ch_hint)
+
+        layout.addWidget(ch_group)
+
         # ---- 底部：窗口列表表格 ----
         table_box = QGroupBox("游戏窗口列表", panel)
         table_box.setObjectName("windowsGroupBox")
@@ -325,9 +367,78 @@ class MonitorTab(QWidget):
         self.preview_widget.sig_target_changed.connect(self.sig_target_window_changed.emit)
         self.preview_widget.sig_roi_changed.connect(self.sig_drone_roi_changed.emit)
 
+        # 监控频道白名单
+        self.btn_add_channel.clicked.connect(self._on_add_channel)
+        self.btn_remove_channel.clicked.connect(self._on_remove_channel)
+        self.line_channel_input.returnPressed.connect(self._on_add_channel)
+        self.list_channels.itemChanged.connect(self._on_channel_item_changed)
+
     def _emit_config_changed(self) -> None:
         """汇总当前预警配置，通过 sig_config_changed 发射。"""
         self.sig_config_changed.emit(self.get_monitor_config())
+
+    # ============================================================
+    #  监控频道白名单
+    # ============================================================
+    def _on_add_channel(self) -> None:
+        """从输入框读取频道名，添加到列表（去重，默认勾选）。"""
+        name = self.line_channel_input.text().strip()
+        if not name:
+            return
+        # 去重检查（不区分大小写）
+        existing = self.get_all_channels()
+        if name.lower() in [c.lower() for c in existing]:
+            self.line_channel_input.clear()
+            return
+        item = QListWidgetItem(name)
+        item.setCheckState(Qt.Checked)  # 默认勾选
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        self.list_channels.addItem(item)
+        self.line_channel_input.clear()
+        self.sig_monitored_channels_changed.emit(self.get_monitored_channels())
+
+    def _on_remove_channel(self) -> None:
+        """删除列表中选中的频道项。"""
+        row = self.list_channels.currentRow()
+        if row < 0:
+            return
+        self.list_channels.takeItem(row)
+        self.sig_monitored_channels_changed.emit(self.get_monitored_channels())
+
+    def _on_channel_item_changed(self, _item) -> None:
+        """复选框切换时发射信号。"""
+        self.sig_monitored_channels_changed.emit(self.get_monitored_channels())
+
+    def set_monitored_channels(self, channels: List[str]) -> None:
+        """
+        外部设置频道白名单（恢复配置时用）。
+
+        参数：
+            channels: 频道名列表，所有频道默认勾选。
+        """
+        self.list_channels.blockSignals(True)
+        try:
+            self.list_channels.clear()
+            for name in channels:
+                item = QListWidgetItem(name)
+                item.setCheckState(Qt.Checked)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                self.list_channels.addItem(item)
+        finally:
+            self.list_channels.blockSignals(False)
+
+    def get_monitored_channels(self) -> List[str]:
+        """返回已勾选的频道名列表。"""
+        result: List[str] = []
+        for i in range(self.list_channels.count()):
+            item = self.list_channels.item(i)
+            if item.checkState() == Qt.Checked:
+                result.append(item.text())
+        return result
+
+    def get_all_channels(self) -> List[str]:
+        """返回所有已添加的频道名列表（含未勾选的）。"""
+        return [self.list_channels.item(i).text() for i in range(self.list_channels.count())]
 
     # ============================================================
     #  对外公共方法
