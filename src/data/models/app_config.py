@@ -20,11 +20,16 @@ class MonitorConfig:
     监控相关的配置项。
 
     字段说明：
-        eve_log_dir: EVE 客户端日志目录（Local/Intel 频道日志所在位置）
+        eve_log_dir: EVE 客户端 Chatlogs 日志目录
+                     （默认自动定位：文档\\EVE\\logs\\Chatlogs）
+        intel_channels: 要监控的 Intel 频道名列表，
+                        例如 ["southeast.imperium"]；
+                        空列表表示监控除本地外的所有频道
         danger_keywords: Intel 频道需要预警的危险关键字列表
         enable_voice: 是否开启语音播报
     """
     eve_log_dir: str = ""                                  # EVE 日志目录路径
+    intel_channels: List[str] = field(default_factory=list)   # Intel 频道名单
     danger_keywords: List[str] = field(default_factory=list)  # 危险关键字列表
     enable_voice: bool = True                              # 是否开启语音
 

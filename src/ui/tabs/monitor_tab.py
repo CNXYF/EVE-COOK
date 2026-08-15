@@ -55,6 +55,11 @@ class MonitorTab(QWidget):
         self._status_label.setObjectName("statusLabel")
         control_layout.addWidget(self._status_label)
 
+        # 当前星系标签：显示 Local 监控追踪到的当前星系
+        self._system_label = QLabel("当前星系：未知")
+        self._system_label.setObjectName("systemLabel")
+        control_layout.addWidget(self._system_label)
+
         control_layout.addStretch()  # 弹性空白，把按钮推到右侧
 
         # 启动按钮：点击后发射 sig_start_clicked 信号
@@ -73,6 +78,15 @@ class MonitorTab(QWidget):
         # ---- 下部：日志显示区 ----
         self.log_viewer = LogViewer(self)
         root_layout.addWidget(self.log_viewer)
+
+    def set_current_system(self, system_name: str) -> None:
+        """
+        刷新"当前星系"显示（供主窗口在收到星系变化信号后调用）。
+
+        参数：
+            system_name: 新的星系名。
+        """
+        self._system_label.setText(f"当前星系：{system_name}")
 
     def set_running_state(self, running: bool) -> None:
         """

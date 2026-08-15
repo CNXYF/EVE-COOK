@@ -9,6 +9,7 @@
               以后要改只需改这一处。
 ============================================================
 """
+import os
 from pathlib import Path
 
 # ---------- 应用基本信息 ----------
@@ -39,6 +40,15 @@ COLOR_INFO = "#8be9fd"         # 信息日志颜色（青）
 # ⚠️ 注意：仅限 Windows 系统
 EVE_WINDOW_CLASS = "EVE"       # EVE 客户端窗口类名（占位，后续实测校准）
 EVE_WINDOW_TITLE_KEYWORD = "EVE Online"  # 窗口标题关键字
+
+# EVE 聊天日志默认目录：文档\EVE\logs\Chatlogs
+# （与客户端安装位置无关，国服/欧服都放在"文档"下）
+# ⚠️ 注意：仅限 Windows 系统（使用 USERPROFILE 环境变量）
+DEFAULT_CHATLOGS_DIR = Path(os.environ.get("USERPROFILE", "")) / "Documents" / "EVE" / "logs" / "Chatlogs"
+
+# 本地频道的可能名称（国服从"本地"，欧服叫 "Local"）
+# 用集合存放，判断时用 `in` 即可，避免写死单一名称
+LOCAL_CHANNEL_NAMES = {"本地", "Local"}
 
 # ---------- 网络请求 ----------
 HTTP_TIMEOUT = 5               # 网络请求超时秒数（强制约束：>=5s）

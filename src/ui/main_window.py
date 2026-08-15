@@ -87,6 +87,11 @@ class MainWindow(QMainWindow):
         if intel_service is not None:
             intel_service.sig_alert.connect(self._alert_overlay.show_alert)
 
+        # ---- Local 星系变化信号 -> 监控页"当前星系"标签 ----
+        local_service = self._service_manager.get("LocalMonitor")
+        if local_service is not None:
+            local_service.sig_system_changed.connect(self._monitor_tab.set_current_system)
+
     @pyqtSlot()
     def _on_start_clicked(self) -> None:
         """启动按钮点击：启动所有服务并刷新界面状态。"""

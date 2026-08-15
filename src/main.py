@@ -37,7 +37,11 @@ from services.local_monitor import LocalMonitorService        # noqa: E402
 from services.service_manager import ServiceManager           # noqa: E402
 from services.translation_service import TranslationService   # noqa: E402
 from ui.main_window import MainWindow            # noqa: E402
-from utils.constants import APP_NAME, SRC_DIR as CONST_SRC_DIR  # noqa: E402
+from utils.constants import (                    # noqa: E402
+    APP_NAME,
+    DEFAULT_CHATLOGS_DIR,
+    SRC_DIR as CONST_SRC_DIR,
+)
 from utils.logger import get_logger              # noqa: E402
 
 logger = get_logger("main")
@@ -79,10 +83,20 @@ def main() -> None:
     logger.info("配置加载完成")
 
     # ---- 第 5 步：创建核心引擎 ----
-    # 日志监视目录：优先用配置里的 EVE 日志目录，没配置就用默认 data 目录
-    from utils.constants import DATA_DIR
-    watch_dir = Path(config.monitor.eve_log_dir) if config.monitor.eve_log_dir \
-        else DATA_DIR / "eve_logs"
+    # 日志监视目录定位规则（优先级从高到低）：
+    #   1. 配置文件里手动指定的 eve_log_dir
+    #   2. 默认路径：文档\EVE\logs\Chatlogs（国服/欧服通用）
+    # ⚠️ 注意：EVE 聊天日志不在客户端安装目录，而在"文档"文件夹
+    if config.monitor.eve_log_dir:
+        watch_dir = Path(config.monitor.eve_log_dir)
+    else:
+        watch_dir = DEFAULT_CHATLOGS_DIR
+
+    if not watch_dir.exists():
+        logger.warning(
+            f"未找到 EVE 日志目录：{watch_dir}。"
+            "请确认已运行过 EVE 客户端，或在配置中手动指定 eve_log_dir"
+        )
 
     log_watcher = LogWatcher(watch_dir)      # 日志监视器（观察者模式）
     audio_manager = AudioManager()           # 音频/TTS 管理器
@@ -92,7 +106,12 @@ def main() -> None:
     service_manager = ServiceManager()
     service_manager.register(LocalMonitorService(log_watcher))
     service_manager.register(
-        IntelMonitorService(log_watcher, audio_manager, config.monitor.danger_keywords)
+        IntelMonitorService(
+            log_watcher,
+            audio_manager,
+            config.monitor.danger_keywords,
+            config.monitor.intel_channels,
+        )
     )
     service_manager.register(DroneMonitorService())
     service_manager.register(TranslationService())

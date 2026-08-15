@@ -1,16 +1,18 @@
 """
 ============================================================
-模块：services/local_monitor.py —— Local 频道监控服务
+模块：services/local_monitor.py —— Local（本地）频道监控服务
 ------------------------------------------------------------
 功能说明：
-    监视 EVE 客户端的 Local（本地）频道日志文件。
-    当本地频道人员列表发生变化（有人进入/离开星系）时，
-    把变化内容通过信号发送给 UI，必要时触发预警。
+    监视 EVE 客户端的"本地"频道日志（国服频道名为"本地"）。
+    已接入真实日志解析：
+    - 识别"频道更换为本地：星系名"系统消息，追踪当前所在星系
+    - 星系变化时发射 sig_system_changed 信号通知 UI
+    - 本地频道有人发言时发射 sig_local_message 信号
 
-    工作流程：
-      LogWatcher（core 层）监听到日志新行
-        -> 回调 _on_log_line 在本服务中处理
-        -> 通过 sig_local_changed 信号通知 UI
+    频道识别原理：
+      EVE 日志文件名 = 频道名_日期_时间_监听者.txt，
+      例如 本地_20260323_232140_2117006221.txt，
+      因此从文件名就能判断这条消息属于哪个频道。
 
     🔒 线程安全说明：
       LogWatcher 的回调运行在 watchdog 线程，
@@ -18,12 +20,18 @@
       Qt 信号跨线程投递是安全的（自动排队到接收方线程）。
 ============================================================
 """
-from typing import Set
+from pathlib import Path
 
 from PyQt5.QtCore import pyqtSignal
 
+from core.chatlog_parser import (
+    channel_name_from_file,
+    extract_local_system,
+    parse_line,
+)
 from core.log_watcher import LogWatcher
 from services.base_service import BaseService
+from utils.constants import LOCAL_CHANNEL_NAMES
 from utils.logger import get_logger
 
 logger = get_logger("local_monitor")
@@ -31,15 +39,19 @@ logger = get_logger("local_monitor")
 
 class LocalMonitorService(BaseService):
     """
-    Local 频道监控服务。
+    Local（本地）频道监控服务。
 
     新增信号：
-        sig_local_changed(int): 本地频道人数变化信号，参数为当前人数。
-                               UI 收到后刷新人数显示。
+        sig_system_changed(str): 当前星系变化信号，参数为新星系名。
+                                 UI 收到后刷新"当前星系"显示。
+        sig_local_message(str, str): 本地频道发言信号，
+                                     参数为 (发言人, 内容)。
     """
 
-    # 本地频道人数变化信号（携带当前人数）
-    sig_local_changed = pyqtSignal(int)
+    # 当前星系变化信号（携带星系名）
+    sig_system_changed = pyqtSignal(str)
+    # 本地频道发言信号（携带 发言人、内容）
+    sig_local_message = pyqtSignal(str, str)
 
     def __init__(self, log_watcher: LogWatcher, parent=None):
         """
@@ -49,8 +61,13 @@ class LocalMonitorService(BaseService):
         """
         super().__init__(service_name="LocalMonitor", parent=parent)
         self._log_watcher = log_watcher
-        # 记录已知的本地频道成员名单，用于对比人员变化
-        self._known_members: Set[str] = set()
+        # 当前所在星系名（收到"频道更换为本地"消息时更新）
+        self._current_system = ""
+
+    @property
+    def current_system(self) -> str:
+        """只读属性：当前所在星系名（未知时为空字符串）。"""
+        return self._current_system
 
     def run(self) -> None:
         """
@@ -78,7 +95,7 @@ class LocalMonitorService(BaseService):
             self.emit_log("INFO", "Local 频道监控已退出")
             self.sig_finished.emit(self.service_name)
 
-    def _on_log_line(self, line: str) -> None:
+    def _on_log_line(self, file_path: Path, line: str) -> None:
         """
         LogWatcher 回调：收到一行新日志。
 
@@ -86,14 +103,32 @@ class LocalMonitorService(BaseService):
         内部禁止抛异常，禁止直接操作 UI。
 
         参数：
-            line: 新增的日志行文本。
+            file_path: 日志文件路径（文件名含频道名）
+            line: 新增的日志行文本
         """
         try:
-            # 骨架阶段：只过滤出 Local 频道相关的行（含 "Local" 关键字）
-            # TODO: 接入真实日志后，按 EVE 日志格式解析进出人员
-            if "Local" in line:
-                self.emit_log("INFO", f"[Local] {line}")
-                # 人数变化时发射信号（骨架阶段暂以名单数量模拟）
-                self.sig_local_changed.emit(len(self._known_members))
+            # ---- 第一步：按文件名过滤，只处理"本地"频道 ----
+            channel = channel_name_from_file(file_path)
+            if channel not in LOCAL_CHANNEL_NAMES:
+                return
+
+            # ---- 第二步：解析消息行 ----
+            message = parse_line(line, channel=channel)
+            if message is None:
+                return  # 文件头、分隔线等非消息行，忽略
+
+            # ---- 第三步：系统消息 -> 检查是否切换了星系 ----
+            if message.is_system:
+                new_system = extract_local_system(message.content)
+                if new_system is not None and new_system != self._current_system:
+                    old = self._current_system or "未知"
+                    self._current_system = new_system
+                    self.emit_log("INFO", f"[Local] 星系变化：{old} -> {new_system}")
+                    self.sig_system_changed.emit(new_system)
+                return
+
+            # ---- 第四步：玩家发言 -> 发射发言信号 ----
+            self.sig_local_message.emit(message.sender, message.content)
+
         except Exception as e:  # noqa: BLE001 —— 回调禁止抛异常
             logger.error(f"Local 日志行处理异常（已拦截）：{e}")
