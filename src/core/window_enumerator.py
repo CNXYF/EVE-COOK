@@ -13,12 +13,29 @@
     EnumWindows 是 C 层回调，异常穿透会导致整个枚举崩溃。
 ============================================================
 """
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Tuple
 
-from utils.constants import EVE_WINDOW_TITLE_KEYWORD
+from utils.constants import (
+    EVE_WINDOW_CLASSES,
+    EVE_WINDOW_TITLE_KEYWORD,
+    EVE_WINDOW_TITLE_ALTERNATIVES,
+)
 from utils.logger import get_logger
 
 logger = get_logger("window_enumerator")
+
+# 非游戏窗口类名：仅靠"标题含 EVE"命中时，只要类名属于这里就直接排除（避免把浏览器/资源管理器/启动器页签误算进去）
+NON_GAME_WINDOW_CLASSES: Tuple[str, ...] = (
+    "MozillaWindowClass",       # Firefox
+    "Chrome_WidgetWin_1",       # Chrome / Chromium 内核（如 EVE 启动器、Edge、KOOK…）
+    "Chrome_WidgetWin_0",       # Chrome 早期内核
+    "CabinetWClass",            # Windows 资源管理器
+    "ExplorerWClass",           # Windows 资源管理器变体
+    "ApplicationFrameWindow",   # UWP 容器
+    "FLUTTER_RUNNER_WIN32_WINDOW",  # Flutter
+    "Qt6101QWindowToolSaveBits",    # Qt 预览窗口（如用户本机 EVE-APM Preview）
+    "Qt5151QWindowIcon",        # 通用 Qt5 应用窗口
+)
 
 # ⚠️ 注意：仅限 Windows 系统
 # pywin32 只在 Windows 可导入，用 try 包裹给出友好报错
@@ -54,16 +71,36 @@ class WindowEnumerator:
 
     def enumerate_eve_windows(self) -> List[WindowInfo]:
         """
-        枚举所有标题包含 EVE 关键字的可见窗口。
+        枚举所有 EVE 客户端窗口。
+
+        匹配策略（任一命中即算，双保险）：
+          A. 窗口类名属于 EVE_WINDOW_CLASSES（默认 "trinityWindow" / "EVE"）
+          B. 窗口标题包含 EVE_WINDOW_TITLE_KEYWORD（默认 "EVE"）
 
         返回：
-            List[WindowInfo]: 匹配到的窗口列表（可能多开，所以是列表）。
+            List[WindowInfo]: 匹配到的窗口列表（多开时会有多条）。
         """
         # pywin32 不可用时返回空列表，调用方按"未找到窗口"处理
         if win32gui is None:
             return []
 
         results: List[WindowInfo] = []
+
+        def _matches_title(title: str) -> bool:
+            """标题匹配：至少命中一个关键字（兼容 EVE Online/EVE 两种格式）。"""
+            if not title:
+                return False
+            for kw in EVE_WINDOW_TITLE_ALTERNATIVES:
+                if kw in title:
+                    return True
+            # 兜底：主关键字也判断一次（保证常量扩展时不遗漏）
+            return bool(EVE_WINDOW_TITLE_KEYWORD and EVE_WINDOW_TITLE_KEYWORD in title)
+
+        def _matches_class(cls: str) -> bool:
+            """类名匹配：属于已知 EVE 窗口类名集合之一。"""
+            if not cls:
+                return False
+            return cls in EVE_WINDOW_CLASSES
 
         def _extract_character_name(title: str) -> str:
             """
@@ -81,7 +118,10 @@ class WindowEnumerator:
             if sep_index != -1:
                 # 分隔符之后的部分即为角色名
                 return processed[sep_index + 2:].strip()
-            # 未找到分隔符，返回空字符串
+            # 未找到分隔符，再尝试只按 "-" 匹配（应对可能的空格缺失）
+            sep_index2 = processed.find("-")
+            if sep_index2 != -1:
+                return processed[sep_index2 + 1:].strip()
             return ""
 
         def _enum_callback(hwnd: int, _extra) -> bool:
@@ -90,62 +130,106 @@ class WindowEnumerator:
 
             ⚠️ 注意：此回调由 C 层调用，内部禁止抛出任何异常，
             所有异常必须就地捕获，否则枚举过程会直接崩溃。
-
-            参数：
-                hwnd: 当前窗口句柄
-                _extra: EnumWindows 透传的附加参数（这里用不到）
-            返回：
-                bool: 返回 True 表示继续枚举下一个窗口
             """
             try:
-                # 跳过不可见窗口（最小化的 EVE 也保留，IsWindowVisible 会过滤）
+                # 跳过不可见窗口
                 if not win32gui.IsWindowVisible(hwnd):
                     return True
 
                 title = win32gui.GetWindowText(hwnd)
-                # 标题包含 EVE 关键字即认为是 EVE 客户端窗口
-                if title and EVE_WINDOW_TITLE_KEYWORD in title:
-                    # 获取进程ID：win32process 不可用时 pid 保持为 0
-                    pid = 0
-                    if win32process is not None:
-                        try:
-                            # GetWindowThreadProcessId 返回 (线程ID, 进程ID)，取第二个值
-                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug(f"获取窗口 {hwnd} 的PID失败：{e}")
+                try:
+                    cls = win32gui.GetClassName(hwnd)
+                except Exception:
+                    cls = ""
 
-                    # 从标题提取角色名
-                    character_name = _extract_character_name(title)
+                # 双保险：类名 或 标题 任一命中就算 EVE 窗口
+                class_hit = _matches_class(cls)
+                title_hit = _matches_title(title)
+                if not (class_hit or title_hit):
+                    return True
 
-                    results.append(WindowInfo(
-                        hwnd=hwnd,
-                        title=title,
-                        pid=pid,
-                        character_name=character_name
-                    ))
+                # 1) 类名已经命中：基本就是 trinityWindow，直接放行（最可靠的判断）
+                # 2) 仅靠标题命中：需要再做严格过滤，避免把浏览器/资源管理器/工具窗口混进来
+                if not class_hit:
+                    # (a) 排除"明确不是游戏窗口"的类名（Firefox / Chrome / Explorer / Qt 预览 等）
+                    if cls in NON_GAME_WINDOW_CLASSES:
+                        logger.debug(f"跳过类名黑名单窗口：hwnd={hwnd} class={cls} title={title}")
+                        return True
+
+                    # (b) 关键词过滤：preview / 启动器 / launcher / installer 等
+                    title_lower = title.lower()
+                    exclude_terms = ("preview", "启动器", "launcher", "installer", "setup", "更新", "update", "-apm")
+                    if any(t in title_lower for t in exclude_terms):
+                        logger.debug(f"跳过疑似非游戏窗口（关键词命中）：hwnd={hwnd} class={cls} title={title}")
+                        return True
+
+                    # (c) 标题格式校验：EVE 游戏主窗口标题是 "EVE - 角色名" 或 "EVE Online - 角色名"
+                    #     ——不满足此模式的一律排除（此条可以把 "EVE角色配置文件…"、"EVE-COOK - …" 之类误报全部过滤掉）
+                    stripped = title.lstrip()
+                    prefix_match = False
+                    for prefix in ("EVE - ", "EVE Online - "):
+                        if stripped.startswith(prefix):
+                            prefix_match = True
+                            break
+                    if not prefix_match:
+                        logger.debug(f"跳过标题格式不匹配窗口：hwnd={hwnd} class={cls} title={title}")
+                        return True
+
+                # 获取进程ID
+                pid = 0
+                if win32process is not None:
+                    try:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug(f"获取窗口 {hwnd} 的PID失败：{e}")
+
+                character_name = _extract_character_name(title)
+                results.append(WindowInfo(
+                    hwnd=hwnd,
+                    title=title,
+                    pid=pid,
+                    character_name=character_name
+                ))
 
             except Exception as e:  # noqa: BLE001 —— 回调禁止抛异常
-                # 某些窗口（如权限受限的系统窗口）读取标题会失败，跳过即可
                 logger.debug(f"枚举窗口 {hwnd} 时出错（已跳过）：{e}")
 
             return True  # 始终返回 True，继续枚举剩余窗口
 
         try:
-            # EnumWindows：让 Windows 把所有顶层窗口逐个交给回调函数
             win32gui.EnumWindows(_enum_callback, None)
-        except Exception as e:  # noqa: BLE001 —— 兜底保护
+        except Exception as e:  # noqa: BLE001
             logger.error(f"窗口枚举失败：{e}")
 
-        logger.info(f"找到 {len(results)} 个 EVE 窗口")
+        logger.info(f"找到 {len(results)} 个 EVE 窗口（类命中/EVE_WINDOW_CLASSES 或 标题含 '{EVE_WINDOW_TITLE_KEYWORD}'）")
         return results
 
     def scan_once(self) -> List[WindowInfo]:
         """
         便捷方法：执行一次窗口扫描，等价于调用 enumerate_eve_windows()。
 
-        此方法作为更直观的对外别名，保留 enumerate_eve_windows() 作为底层实现。
-
         返回：
             List[WindowInfo]: 匹配到的 EVE 窗口列表
         """
         return self.enumerate_eve_windows()
+
+    def find_by_character_name(self, character_name: str, case_sensitive: bool = False) -> List[WindowInfo]:
+        """
+        按角色名从当前扫描结果中筛选窗口。
+
+        参数：
+            character_name: 角色名（允许模糊包含）
+            case_sensitive: 是否区分大小写
+        返回：
+            List[WindowInfo]: 所有包含该角色名的窗口
+        """
+        all_windows = self.enumerate_eve_windows()
+        if not character_name:
+            return all_windows
+        target = character_name if case_sensitive else character_name.lower()
+        result: List[WindowInfo] = []
+        for w in all_windows:
+            name = w.character_name if case_sensitive else w.character_name.lower()
+            if target in name:
+                result.append(w)
+        return result

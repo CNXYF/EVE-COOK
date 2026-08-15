@@ -36,10 +36,13 @@ COLOR_WARN = "#f1fa8c"         # 警告日志颜色（黄）
 COLOR_INFO = "#8be9fd"         # 信息日志颜色（青）
 
 # ---------- EVE 客户端相关 ----------
-# EVE Online 主窗口的类名（pywin32 枚举窗口时用于匹配）
+# 真实窗口类名（通过本机 pywin32 枚举实测）：
+#   - 游戏主窗口："trinityWindow"（国服/欧服通用，最可靠的匹配依据）
+#   - 历史上老版本/启动器可能使用过 "EVE"，保留兼容
 # ⚠️ 注意：仅限 Windows 系统
-EVE_WINDOW_CLASS = "EVE"       # EVE 客户端窗口类名（占位，后续实测校准）
-EVE_WINDOW_TITLE_KEYWORD = "EVE Online"  # 窗口标题关键字
+EVE_WINDOW_CLASSES = ("trinityWindow", "EVE")  # 窗口类名集合，任一命中就算
+EVE_WINDOW_TITLE_KEYWORD = "EVE"  # 窗口标题关键字（实测标题为 "EVE - 角色名"，不包含 Online）
+EVE_WINDOW_TITLE_ALTERNATIVES = ("EVE", "EVE Online")  # 标题备用关键字，做双保险
 
 # EVE 聊天日志默认目录：文档\EVE\logs\Chatlogs
 # （与客户端安装位置无关，国服/欧服都放在"文档"下）
