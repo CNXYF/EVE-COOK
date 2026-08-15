@@ -153,10 +153,14 @@ def main() -> None:
     )
     service_manager.register(intel_service)
 
-    # 6c) DroneMonitor：传入 audio_manager + voice_drone_warning
+    # 6c) DroneMonitor：传入 audio_manager + voice_drone_warning + 保存的 ROI/间隔
+    drone_cfg = config.monitor.drone
     drone_service = DroneMonitorService(
+        interval_ms=drone_cfg.interval_ms,
         audio_manager=audio_manager,
         voice_enabled=config.monitor.alert.voice_drone_warning,
+        target_hwnd=drone_cfg.target_hwnd,
+        drone_roi=tuple(drone_cfg.roi_rect) if drone_cfg.roi_rect is not None else None,
     )
     service_manager.register(drone_service)
 

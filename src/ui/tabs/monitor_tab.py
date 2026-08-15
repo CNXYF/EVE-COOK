@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.window_enumerator import WindowInfo
+from ui.widgets.preview_widget import PreviewWidget
 from utils.constants import (
     COLOR_ERROR,
     COLOR_INFO,
@@ -72,6 +73,8 @@ class MonitorTab(QWidget):
     sig_drone_check = pyqtSignal()
     sig_refresh_preview = pyqtSignal()
     sig_config_changed = pyqtSignal(dict)
+    sig_target_window_changed = pyqtSignal(int)  # 预览区选择的目标窗口变更 (hwnd)
+    sig_drone_roi_changed = pyqtSignal(object)    # 无人机 ROI 区域变更 ((L,T,R,B) 或 None)
 
     def __init__(self, parent=None):
         """构建监控中心页界面。"""
@@ -271,27 +274,21 @@ class MonitorTab(QWidget):
 
         layout.addWidget(log_box, stretch=1)
 
-        # ---- 底部：视觉预览 ----
-        preview_box = QGroupBox("视觉预览", panel)
+        # ---- 底部：视觉预览（新：PreviewWidget = 下拉+刷新按钮+画布+ROI 拖拽） ----
+        preview_box = QGroupBox("视觉预览 / 无人机区域框选", panel)
         preview_box.setObjectName("previewGroupBox")
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(4, 4, 4, 4)
+        preview_layout.setSpacing(4)
 
-        self.preview_label = QLabel("暂无预览", preview_box)
-        self.preview_label.setObjectName("preview_label")
-        self.preview_label.setFixedSize(360, 240)
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        # 边框样式：1px #1a2a2a
-        self.preview_label.setStyleSheet(
-            "QLabel#preview_label {"
-            "  border: 1px solid #1a2a2a;"
-            "  background-color: #0d1219;"
-            "  color: #555b63;"
-            "}"
-        )
-        preview_layout.addWidget(self.preview_label, 0, Qt.AlignHCenter)
+        self.preview_widget = PreviewWidget(preview_box)
+        self.preview_widget.setObjectName("preview_widget")
+        preview_layout.addWidget(self.preview_widget, stretch=1)
 
-        layout.addWidget(preview_box)
+        # 旧兼容属性（外部调用 set_preview_image 的代码可以保持工作）
+        self.preview_label = self.preview_widget.lbl_status
+
+        layout.addWidget(preview_box, stretch=1)
 
         return panel
 
@@ -304,6 +301,9 @@ class MonitorTab(QWidget):
         self.btn_scan_once.clicked.connect(self.sig_scan_once.emit)
         self.btn_local_check.clicked.connect(self.sig_local_check.emit)
         self.btn_drone_check.clicked.connect(self.sig_drone_check.emit)
+        # 刷新预览按钮：优先走 PreviewWidget 自带截图（用户已经选了目标窗口时直接生效），
+        # 同时也对外发信号让外层做日志记录。
+        self.btn_refresh_preview.clicked.connect(self.preview_widget.refresh_preview)
         self.btn_refresh_preview.clicked.connect(self.sig_refresh_preview.emit)
         self.btn_start.clicked.connect(self.sig_start_all.emit)
         self.btn_start.clicked.connect(self.sig_start_clicked.emit)  # 旧版兼容
@@ -320,6 +320,10 @@ class MonitorTab(QWidget):
         self.chk_voice_system.stateChanged.connect(self._emit_config_changed)
         self.chk_voice_local.stateChanged.connect(self._emit_config_changed)
         self.chk_voice_drone.stateChanged.connect(self._emit_config_changed)
+
+        # PreviewWidget 对外信号：目标窗口 / ROI 变化
+        self.preview_widget.sig_target_changed.connect(self.sig_target_window_changed.emit)
+        self.preview_widget.sig_roi_changed.connect(self.sig_drone_roi_changed.emit)
 
     def _emit_config_changed(self) -> None:
         """汇总当前预警配置，通过 sig_config_changed 发射。"""
@@ -415,7 +419,7 @@ class MonitorTab(QWidget):
         drone_enabled: Optional[Dict[int, bool]] = None,
     ) -> None:
         """
-        刷新窗口列表表格。
+        刷新窗口列表表格，并同步窗口列表到预览区的"目标窗口"下拉。
 
         参数：
             windows:       WindowInfo 列表。
@@ -429,6 +433,16 @@ class MonitorTab(QWidget):
             local_enabled = {}
         if drone_enabled is None:
             drone_enabled = {}
+
+        # 同步到预览控件的窗口下拉（顺便记住之前选中的 hwnd，尽量不破坏用户选择）
+        previous_hwnd = self.preview_widget.current_hwnd()
+        self.preview_widget.set_windows(windows)
+        if previous_hwnd != 0:
+            self.preview_widget.set_target_hwnd(previous_hwnd)
+        else:
+            # 没选过时：如果窗口列表不为空，默认选第一个（更"开箱即用"）
+            if windows:
+                self.preview_widget.set_target_hwnd(windows[0].hwnd)
 
         # 清空旧行
         self.table_windows.setRowCount(0)
@@ -478,23 +492,44 @@ class MonitorTab(QWidget):
 
     def set_preview_image(self, image_or_none: Optional[QPixmap]) -> None:
         """
-        设置视觉预览图像。
+        兼容旧接口：设置视觉预览图像。
 
-        参数：
-            image_or_none: QPixmap 则显示该图；None 则显示占位文字。
+        说明：新代码推荐直接用 self.preview_widget.refresh_preview() 按真实窗口截图，
+        但外部若仍然传入 QPixmap（比如本地关系图、无人机目标可视化），这里也能正常显示。
         """
-        if image_or_none is None or image_or_none.isNull():
-            self.preview_label.clear()
-            self.preview_label.setText("暂无预览")
-        else:
-            # 按 label 尺寸缩放显示，保持比例
-            scaled = image_or_none.scaled(
-                self.preview_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-            self.preview_label.clear()
-            self.preview_label.setPixmap(scaled)
+        # 走 PreviewWidget 画布的 set_content 把图显示上去（并清空 ROI 矩形显示，因为不是同一张图了）
+        self.preview_widget.canvas.set_content(image_or_none)
+        self.preview_widget.canvas.set_roi(None)
+
+    # ============================================================
+    #  新增：预览区对外快捷方法（目标窗口 / ROI）
+    # ============================================================
+    def current_preview_hwnd(self) -> int:
+        """预览区当前选中的目标窗口句柄（0 代表未选中）。"""
+        return self.preview_widget.current_hwnd()
+
+    def current_drone_roi(self):
+        """
+        预览区当前框选的无人机 ROI。
+
+        返回：
+            (L, T, R, B) 相对真实窗口客户区坐标；未框选时为 None。
+        """
+        return self.preview_widget.current_roi()
+
+    def set_preview_target_hwnd(self, hwnd: int) -> None:
+        """编程方式设置预览区目标窗口；0 表示取消选择。"""
+        self.preview_widget.set_target_hwnd(hwnd)
+
+    def set_drone_roi(self, roi) -> None:
+        """编程方式设置预览区 ROI。"""
+        self.preview_widget._roi_window = roi
+        self.preview_widget.canvas.set_roi(roi)
+        self.preview_widget._refresh_display_state_label()
+
+    def refresh_preview_now(self) -> None:
+        """编程方式触发『刷新预览』。"""
+        self.preview_widget.refresh_preview()
 
     def get_monitor_config(self) -> dict:
         """

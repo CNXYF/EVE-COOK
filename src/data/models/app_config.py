@@ -11,7 +11,7 @@
 ============================================================
 """
 from dataclasses import dataclass, field, asdict
-from typing import List
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -38,6 +38,26 @@ class AlertConfig:
 
 
 @dataclass
+class DroneConfig:
+    """
+    无人机监控专用配置（与 UI 预览区双向同步 + 持久化）。
+
+    字段说明：
+        target_hwnd: 最近一次选中的目标窗口句柄；0 表示未选中。
+                    ⚠️ 下次启动时窗口句柄通常会变化，所以读取配置后
+                    仅用于"尝试还原"，还原失败时 UI 会自动切回未选中。
+        roi_rect: 最近一次框选的无人机面板矩形，
+                  格式 (L, T, R, B)，像素相对窗口客户区左上角。
+                  若窗口分辨率不变，框选结果跨会话仍然有效；
+                  若用户切换了客户端分辨率，请重新框选。
+        interval_ms: 检查间隔（毫秒），默认 2 秒一次
+    """
+    target_hwnd: int = 0
+    roi_rect: Optional[Tuple[int, int, int, int]] = None
+    interval_ms: int = 2000
+
+
+@dataclass
 class MonitorConfig:
     """
     监控相关的配置项。
@@ -52,6 +72,7 @@ class MonitorConfig:
         enable_voice: 是否开启语音播报
         hostile_list: 敌对角色名列表，用于精确匹配预警目标
         translation_channels: 需要翻译的频道名列表
+        drone: 无人机监控子配置（目标窗口 + ROI + 间隔）
         alert: 预警子配置（跳数范围、时间窗口、语音开关等）
     """
     eve_log_dir: str = ""                                         # EVE 日志目录路径
@@ -60,6 +81,7 @@ class MonitorConfig:
     enable_voice: bool = True                                     # 是否开启语音
     hostile_list: List[str] = field(default_factory=list)         # 敌对角色名列表
     translation_channels: List[str] = field(default_factory=list) # 需要翻译的频道名
+    drone: DroneConfig = field(default_factory=DroneConfig)       # 无人机子配置
     alert: AlertConfig = field(default_factory=AlertConfig)       # 预警子配置
 
 
@@ -103,6 +125,22 @@ class AppConfig:
 
         alert_data = monitor_data.get("alert", {}) or {}
         monitor_data["alert"] = AlertConfig(**alert_data)
+
+        drone_data = monitor_data.get("drone", {}) or {}
+        # roi_rect: 旧配置不存在 / 长度不是 4 / 类型错误时，置 None
+        raw_roi = drone_data.get("roi_rect", None)
+        if raw_roi is not None:
+            if isinstance(raw_roi, (list, tuple)) and len(raw_roi) == 4:
+                try:
+                    drone_data["roi_rect"] = (
+                        int(raw_roi[0]), int(raw_roi[1]),
+                        int(raw_roi[2]), int(raw_roi[3]),
+                    )
+                except (TypeError, ValueError):
+                    drone_data["roi_rect"] = None
+            else:
+                drone_data["roi_rect"] = None
+        monitor_data["drone"] = DroneConfig(**drone_data)
 
         return cls(
             monitor=MonitorConfig(**monitor_data),

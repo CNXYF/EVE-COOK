@@ -17,7 +17,7 @@
 """
 import random
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from PyQt5.QtCore import pyqtSignal
 
@@ -32,6 +32,10 @@ try:
     from core.audio_manager import AudioManager
 except ImportError:
     AudioManager = None  # type: ignore
+
+
+# ROI 矩形：(L, T, R, B)，相对"窗口客户区左上角"像素坐标
+RoiRect = Tuple[int, int, int, int]
 
 
 class DroneStatus(Enum):
@@ -66,6 +70,7 @@ class DroneMonitorService(BaseService):
         audio_manager: Optional["AudioManager"] = None,
         voice_enabled: bool = True,
         target_hwnd: int = 0,
+        drone_roi: Optional[RoiRect] = None,
         parent=None,
     ):
         """
@@ -74,6 +79,8 @@ class DroneMonitorService(BaseService):
             audio_manager: 音频管理器实例，用于 TTS 语音播报（可选）
             voice_enabled: 是否启用语音播报（默认 True）
             target_hwnd: 指定监控的窗口句柄，0 = 监控所有 EVE 窗口（默认 0）
+            drone_roi: 无人机面板 ROI（L, T, R, B 相对窗口客户区）
+                       None 表示尚未框选，服务后续通过 set_drone_roi 接收
             parent: Qt 父对象
         """
         super().__init__(service_name="DroneMonitor", parent=parent)
@@ -86,6 +93,9 @@ class DroneMonitorService(BaseService):
 
         # 目标窗口句柄（0 = 所有窗口）
         self._target_hwnd = target_hwnd
+
+        # 无人机监控 ROI（窗口客户区坐标系），后续接入真实截图识别时使用
+        self._drone_roi: Optional[RoiRect] = drone_roi
 
         # 每个窗口独立记录上一次状态：hwnd -> DroneStatus
         self._last_statuses: Dict[int, DroneStatus] = {}
@@ -109,6 +119,30 @@ class DroneMonitorService(BaseService):
             "INFO",
             f"监控目标窗口已切换：{old_target or '全部窗口'} → {hwnd or '全部窗口'}"
         )
+
+    def set_drone_roi(self, roi: Optional[RoiRect]) -> None:
+        """
+        运行时设置/清除无人机面板 ROI 矩形。
+
+        参数：
+            roi: (L, T, R, B) 相对窗口客户区左上角；None 表示清除 ROI。
+        """
+        old = self._drone_roi
+        self._drone_roi = roi
+        if old == roi:
+            return
+        if roi is None:
+            self.emit_log("INFO", "无人机监控区域已清除")
+        else:
+            L, T, R, B = roi
+            self.emit_log(
+                "INFO",
+                f"无人机监控区域已更新：({L},{T}) → ({R},{B})  尺寸 {R-L}×{B-T}px"
+            )
+
+    def drone_roi(self) -> Optional[RoiRect]:
+        """返回当前 ROI，未设置时返回 None。"""
+        return self._drone_roi
 
     def run(self) -> None:
         """

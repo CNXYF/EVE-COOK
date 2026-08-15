@@ -97,6 +97,21 @@ class MainWindow(QMainWindow):
                 self._config.monitor.translation_channels
             )
 
+        # ---- 初始化预览区（无人机目标窗口 + ROI）配置显示 ----
+        if self._config is not None:
+            drone_cfg = self._config.monitor.drone
+            # 先尝试还原目标窗口句柄；若句柄不存在则 PreviewWidget 会切回"未选中"，
+            # 用户扫窗口后自然能看到对应下拉选项。
+            self._monitor_tab.set_preview_target_hwnd(drone_cfg.target_hwnd)
+            # 还原 ROI 框（如果有的话）
+            if drone_cfg.roi_rect is not None:
+                self._monitor_tab.set_drone_roi(tuple(drone_cfg.roi_rect))
+            # 同步到无人机服务（服务即使未启动，配置也已写入，启动后立即生效）
+            if self._drone_service is not None:
+                self._drone_service.set_drone_roi(
+                    tuple(drone_cfg.roi_rect) if drone_cfg.roi_rect is not None else None
+                )
+
     def _build_ui(self) -> None:
         """
         构建选项卡 UI：
@@ -155,6 +170,15 @@ class MainWindow(QMainWindow):
 
         # 新版信号：监控配置变更
         self._monitor_tab.sig_config_changed.connect(self._on_monitor_config_changed)
+
+        # 新增：预览区"目标窗口"变化 + "无人机 ROI"变化 -> 服务 + 配置持久化
+        self._monitor_tab.sig_target_window_changed.connect(self._on_target_window_changed)
+        self._monitor_tab.sig_drone_roi_changed.connect(self._on_drone_roi_changed)
+
+        # 新增：预览区截图失败 -> 写日志（让用户知道为什么是黑屏）
+        self._monitor_tab.preview_widget.sig_preview_failed.connect(
+            lambda msg: self._monitor_tab.append_log("WARNING", f"预览刷新失败：{msg}")
+        )
 
         # ============================================================
         #  第二部分：翻译页配置变更
@@ -336,6 +360,72 @@ class MainWindow(QMainWindow):
                 home_system=alert.home_system,
                 jump_range=alert.jump_range,
                 voice_enabled=alert.voice_system_warning,
+            )
+
+    @pyqtSlot(int)
+    def _on_target_window_changed(self, hwnd: int) -> None:
+        """
+        预览区选中的目标窗口变更：同步到 DroneMonitor + 写入配置。
+
+        参数：
+            hwnd: 新的目标窗口句柄，0 表示未选中。
+        """
+        # 1. 同步到 DroneMonitor
+        if self._drone_service is not None:
+            self._drone_service.set_target_window(hwnd)
+
+        # 2. 写入配置并保存（配置字段存在就写）
+        if self._config is not None:
+            try:
+                if self._config.monitor.drone.target_hwnd != hwnd:
+                    self._config.monitor.drone.target_hwnd = int(hwnd)
+                    if self._config_manager is not None:
+                        self._config_manager.save(self._config)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"保存 drone.target_hwnd 配置失败：{e}")
+
+        self._monitor_tab.append_log(
+            "INFO",
+            f"预览目标窗口已切换到：{'未选中' if hwnd == 0 else f'句柄 0x{hwnd:X}'}"
+        )
+
+    @pyqtSlot(object)
+    def _on_drone_roi_changed(self, roi) -> None:
+        """
+        预览区无人机 ROI 变更：同步到 DroneMonitor + 写入配置。
+
+        参数：
+            roi: (L, T, R, B) 相对窗口客户区坐标；或 None 表示清除。
+        """
+        # 归一化 ROI：list/tuple -> tuple；非法其他值 -> None
+        normalized = None
+        if roi is not None and isinstance(roi, (list, tuple)) and len(roi) == 4:
+            try:
+                normalized = (int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
+            except (TypeError, ValueError):
+                normalized = None
+
+        # 1. 同步到 DroneMonitor
+        if self._drone_service is not None:
+            self._drone_service.set_drone_roi(normalized)
+
+        # 2. 写入配置并保存
+        if self._config is not None:
+            try:
+                if self._config.monitor.drone.roi_rect != normalized:
+                    self._config.monitor.drone.roi_rect = normalized
+                    if self._config_manager is not None:
+                        self._config_manager.save(self._config)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"保存 drone.roi_rect 配置失败：{e}")
+
+        if normalized is None:
+            self._monitor_tab.append_log("INFO", "无人机监控区域已清除")
+        else:
+            L, T, R, B = normalized
+            self._monitor_tab.append_log(
+                "INFO",
+                f"无人机监控区域已保存：({L},{T}) → ({R},{B})  {R-L}×{B-T}px"
             )
 
     @pyqtSlot(list)
