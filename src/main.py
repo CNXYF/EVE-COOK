@@ -153,14 +153,15 @@ def main() -> None:
     )
     service_manager.register(intel_service)
 
-    # 6c) DroneMonitor：传入 audio_manager + voice_drone_warning + 保存的 ROI/间隔
+    # 6c) DroneMonitor：日志驱动型 —— 订阅 LogWatcher，按 drone_keywords 检测无人机受损
+    #    变更说明：已从截图识别改为日志关键字检测，
+    #             不再依赖窗口句柄/ROI/截图间隔。
     drone_cfg = config.monitor.drone
     drone_service = DroneMonitorService(
-        interval_ms=drone_cfg.interval_ms,
+        log_watcher=log_watcher,
+        drone_keywords=list(drone_cfg.drone_keywords),
         audio_manager=audio_manager,
         voice_enabled=config.monitor.alert.voice_drone_warning,
-        target_hwnd=drone_cfg.target_hwnd,
-        drone_roi=tuple(drone_cfg.roi_rect) if drone_cfg.roi_rect is not None else None,
     )
     service_manager.register(drone_service)
 

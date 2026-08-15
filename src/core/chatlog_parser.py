@@ -270,3 +270,62 @@ def extract_system_names_from_text(content: str) -> List[str]:
     """
     matches = _SYSTEM_ID_PATTERN.findall(content)
     return [m.upper() for m in matches]
+
+
+def listener_id_from_file(file_path: Path) -> Optional[str]:
+    """
+    从日志文件名解析"监听者ID"（即角色的数字 ID）。
+
+    文件名规律：频道名_日期_时间_监听者ID.txt
+    例如 "本地_20260323_232140_2117006221.txt" -> "2117006221"
+         "southeast.imperium_20260323_232140_2117006221.txt" -> "2117006221"
+
+    参数：
+        file_path: 日志文件路径。
+
+    返回：
+        str: 监听者ID（纯数字字符串）；无法识别时返回 None。
+    """
+    stem = file_path.stem  # 文件名去掉 .txt 后缀
+    parts = stem.split("_")
+
+    # 合法规律：至少 4 段，倒数第 3 段为 8 位日期，倒数第 2 段为 6 位时间，
+    # 最后 1 段为纯数字监听者ID
+    if len(parts) >= 4 and len(parts[-3]) == 8 and parts[-3].isdigit() \
+            and len(parts[-2]) == 6 and parts[-2].isdigit() \
+            and parts[-1].isdigit():
+        return parts[-1]
+
+    return None
+
+
+def scan_channels(log_dir: Path) -> List[str]:
+    """
+    扫描 Chatlogs 目录，提取所有不同的频道名。
+
+    用途：让用户在界面上看到"当前有哪些频道可监控"，再勾选要监控的频道。
+    不区分监听者ID（多开角色时同一频道会出现多份日志，只取唯一频道名）。
+
+    参数：
+        log_dir: Chatlogs 目录路径。
+
+    返回：
+        List[str]: 去重后的频道名列表，按字母/拼音顺序排序。
+                   目录不存在或无日志时返回空列表。
+    """
+    if not log_dir.exists() or not log_dir.is_dir():
+        logger.debug(f"频道扫描：目录不存在或非目录 {log_dir}")
+        return []
+
+    channels: set = set()
+    try:
+        for txt_file in log_dir.glob("*.txt"):
+            name = channel_name_from_file(txt_file)
+            if name:
+                channels.add(name)
+    except OSError as e:
+        logger.error(f"扫描频道目录失败 {log_dir}：{e}")
+        return []
+
+    # 排序返回（中文频道名按 Unicode 排序，可读性尚可）
+    return sorted(channels)

@@ -40,21 +40,17 @@ class AlertConfig:
 @dataclass
 class DroneConfig:
     """
-    无人机监控专用配置（与 UI 预览区双向同步 + 持久化）。
+    无人机监控专用配置（日志驱动模式）。
+
+    说明：无人机监控已从"截图识别"改为"日志关键字检测"，
+          因此不再需要目标窗口句柄和 ROI 框选区域。
 
     字段说明：
-        target_hwnd: 最近一次选中的目标窗口句柄；0 表示未选中。
-                    ⚠️ 下次启动时窗口句柄通常会变化，所以读取配置后
-                    仅用于"尝试还原"，还原失败时 UI 会自动切回未选中。
-        roi_rect: 最近一次框选的无人机面板矩形，
-                  格式 (L, T, R, B)，像素相对窗口客户区左上角。
-                  若窗口分辨率不变，框选结果跨会话仍然有效；
-                  若用户切换了客户端分辨率，请重新框选。
-        interval_ms: 检查间隔（毫秒），默认 2 秒一次
+        drone_keywords: 无人机受损关键字列表。
+                        LogWatcher 广播的日志行命中任一关键字即触发预警。
+                        空列表表示使用服务层内置默认关键字。
     """
-    target_hwnd: int = 0
-    roi_rect: Optional[Tuple[int, int, int, int]] = None
-    interval_ms: int = 2000
+    drone_keywords: List[str] = field(default_factory=list)  # 无人机受损关键字
 
 
 @dataclass
@@ -128,20 +124,12 @@ class AppConfig:
         monitor_data["alert"] = AlertConfig(**alert_data)
 
         drone_data = monitor_data.get("drone", {}) or {}
-        # roi_rect: 旧配置不存在 / 长度不是 4 / 类型错误时，置 None
-        raw_roi = drone_data.get("roi_rect", None)
-        if raw_roi is not None:
-            if isinstance(raw_roi, (list, tuple)) and len(raw_roi) == 4:
-                try:
-                    drone_data["roi_rect"] = (
-                        int(raw_roi[0]), int(raw_roi[1]),
-                        int(raw_roi[2]), int(raw_roi[3]),
-                    )
-                except (TypeError, ValueError):
-                    drone_data["roi_rect"] = None
-            else:
-                drone_data["roi_rect"] = None
-        monitor_data["drone"] = DroneConfig(**drone_data)
+        # 兼容旧配置：旧版含 target_hwnd/roi_rect/interval_ms 字段，新版已移除。
+        # 这里只取 drone_keywords，忽略其他旧字段，避免 dataclass 报"意外参数"。
+        raw_keywords = drone_data.get("drone_keywords", []) or []
+        monitor_data["drone"] = DroneConfig(
+            drone_keywords=[str(k) for k in raw_keywords]
+        )
 
         return cls(
             monitor=MonitorConfig(**monitor_data),

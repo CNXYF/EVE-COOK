@@ -32,6 +32,9 @@ from watchdog.observers import Observer
 
 from utils.logger import get_logger
 
+# 同层 import：用于扫描目录发现可用频道名
+from core.chatlog_parser import scan_channels
+
 logger = get_logger("log_watcher")
 
 # 订阅者回调的类型别名：接收两个参数（日志文件路径, 新增的日志行文本）
@@ -123,6 +126,23 @@ class LogWatcher:
             logger.info(f"频道白名单已设置：{sorted(self._channel_whitelist)}")
         else:
             logger.info("频道白名单已清空（监控所有频道）")
+
+    @property
+    def watch_dir(self) -> Path:
+        """只读属性：当前监听的日志目录路径。"""
+        return self._watch_dir
+
+    def discover_channels(self) -> List[str]:
+        """
+        扫描监听目录，返回所有不同的频道名（去重排序）。
+
+        用途：UI 调用此方法获取"可监控的频道列表"，展示给用户勾选。
+        不区分监听者ID，多开角色时同一频道只返回一次。
+
+        返回：
+            List[str]: 频道名列表；目录不存在或无日志时返回空列表。
+        """
+        return scan_channels(self._watch_dir)
 
     def _is_channel_allowed(self, file_path: Path) -> bool:
         """

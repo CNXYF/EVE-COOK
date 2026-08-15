@@ -101,20 +101,14 @@ class MainWindow(QMainWindow):
                 self._config.monitor.translation_channels
             )
 
-        # ---- 初始化预览区（无人机目标窗口 + ROI）配置显示 ----
+        # ---- 初始化无人机关键字（从配置恢复 + 同步到服务）----
+        # 说明：set_drone_keywords 内部用 blockSignals 保护，不会触发信号，
+        #       因此必须手动把关键字下发到 DroneMonitorService。
         if self._config is not None:
-            drone_cfg = self._config.monitor.drone
-            # 先尝试还原目标窗口句柄；若句柄不存在则 PreviewWidget 会切回"未选中"，
-            # 用户扫窗口后自然能看到对应下拉选项。
-            self._monitor_tab.set_preview_target_hwnd(drone_cfg.target_hwnd)
-            # 还原 ROI 框（如果有的话）
-            if drone_cfg.roi_rect is not None:
-                self._monitor_tab.set_drone_roi(tuple(drone_cfg.roi_rect))
-            # 同步到无人机服务（服务即使未启动，配置也已写入，启动后立即生效）
+            keywords = list(self._config.monitor.drone.drone_keywords)
+            self._monitor_tab.set_drone_keywords(keywords)
             if self._drone_service is not None:
-                self._drone_service.set_drone_roi(
-                    tuple(drone_cfg.roi_rect) if drone_cfg.roi_rect is not None else None
-                )
+                self._drone_service.set_drone_keywords(keywords)
 
         # ---- 初始化监控频道白名单（从配置恢复 + 同步到 LogWatcher）----
         # 说明：set_monitored_channels 内部用 blockSignals 保护，
@@ -178,9 +172,6 @@ class MainWindow(QMainWindow):
         self._monitor_tab.sig_drone_check.connect(
             lambda: self._monitor_tab.append_log("INFO", "手动触发 无人机 检查")
         )
-        self._monitor_tab.sig_refresh_preview.connect(
-            lambda: self._monitor_tab.append_log("INFO", "手动触发 刷新预览 检查")
-        )
 
         # 新版信号：监控配置变更
         self._monitor_tab.sig_config_changed.connect(self._on_monitor_config_changed)
@@ -192,14 +183,11 @@ class MainWindow(QMainWindow):
             self._on_monitored_channels_changed
         )
 
-        # 新增：预览区"目标窗口"变化 + "无人机 ROI"变化 -> 服务 + 配置持久化
-        self._monitor_tab.sig_target_window_changed.connect(self._on_target_window_changed)
-        self._monitor_tab.sig_drone_roi_changed.connect(self._on_drone_roi_changed)
+        # 新增：频道发现请求 -> 扫描 Chatlogs 目录并回填 UI
+        self._monitor_tab.sig_discover_channels.connect(self._on_discover_channels)
 
-        # 新增：预览区截图失败 -> 写日志（让用户知道为什么是黑屏）
-        self._monitor_tab.preview_widget.sig_preview_failed.connect(
-            lambda msg: self._monitor_tab.append_log("WARNING", f"预览刷新失败：{msg}")
-        )
+        # 新增：无人机关键字变化 -> 持久化配置 + 同步到 DroneMonitorService
+        self._monitor_tab.sig_drone_keywords_changed.connect(self._on_drone_keywords_changed)
 
         # ============================================================
         #  第二部分：翻译页配置变更
@@ -249,16 +237,10 @@ class MainWindow(QMainWindow):
             self._local_service.sig_alert_triggered.connect(self._route_alert_to_ui)
 
         # ============================================================
-        #  第七部分：DroneMonitor 信号
+        #  第七部分：DroneMonitor 信号（日志驱动：仅预警信号）
         # ============================================================
         if self._drone_service is not None:
-            # 状态变更 -> INFO 日志
-            self._drone_service.sig_status_changed.connect(
-                lambda hwnd, char, status: self._monitor_tab.append_log(
-                    "INFO", f"[无人机] {char} 状态变更：{status}"
-                )
-            )
-            # 无人机预警 -> WARNING 日志 + 悬浮窗
+            # 无人机受损预警 -> WARNING 日志 + 悬浮窗
             self._drone_service.sig_drone_alert.connect(self._route_alert_to_ui)
 
     # ============================================================
@@ -383,71 +365,64 @@ class MainWindow(QMainWindow):
                 voice_enabled=alert.voice_system_warning,
             )
 
-    @pyqtSlot(int)
-    def _on_target_window_changed(self, hwnd: int) -> None:
+    @pyqtSlot()
+    def _on_discover_channels(self) -> None:
         """
-        预览区选中的目标窗口变更：同步到 DroneMonitor + 写入配置。
+        频道发现：扫描 Chatlogs 目录，把找到的频道列表回填到 UI。
 
-        参数：
-            hwnd: 新的目标窗口句柄，0 表示未选中。
+        说明：扫描逻辑在 LogWatcher.discover_channels 中实现（core 层），
+              本方法只负责调用 + 把结果传给 MonitorTab 展示。
         """
-        # 1. 同步到 DroneMonitor
-        if self._drone_service is not None:
-            self._drone_service.set_target_window(hwnd)
+        if self._log_watcher is None:
+            self._monitor_tab.append_log("WARNING", "日志监视器未初始化，无法扫描频道")
+            return
 
-        # 2. 写入配置并保存（配置字段存在就写）
-        if self._config is not None:
-            try:
-                if self._config.monitor.drone.target_hwnd != hwnd:
-                    self._config.monitor.drone.target_hwnd = int(hwnd)
-                    if self._config_manager is not None:
-                        self._config_manager.save(self._config)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"保存 drone.target_hwnd 配置失败：{e}")
+        try:
+            channels = self._log_watcher.discover_channels()
+        except Exception as e:  # noqa: BLE001
+            self._monitor_tab.append_log("ERROR", f"扫描频道失败：{e}")
+            return
 
+        if not channels:
+            self._monitor_tab.append_log(
+                "WARNING",
+                f"未在 {self._log_watcher.watch_dir} 发现任何频道日志，"
+                "请确认已运行 EVE 客户端并产生过聊天记录"
+            )
+            return
+
+        # 回填到 UI（保留已勾选状态，新增项默认勾选）
+        self._monitor_tab.set_discovered_channels(channels)
         self._monitor_tab.append_log(
-            "INFO",
-            f"预览目标窗口已切换到：{'未选中' if hwnd == 0 else f'句柄 0x{hwnd:X}'}"
+            "INFO", f"频道扫描完成，共发现 {len(channels)} 个频道"
         )
 
-    @pyqtSlot(object)
-    def _on_drone_roi_changed(self, roi) -> None:
+    @pyqtSlot(list)
+    def _on_drone_keywords_changed(self, keywords: list) -> None:
         """
-        预览区无人机 ROI 变更：同步到 DroneMonitor + 写入配置。
+        无人机关键字变更：写入配置 + 即时下发到 DroneMonitorService。
 
         参数：
-            roi: (L, T, R, B) 相对窗口客户区坐标；或 None 表示清除。
+            keywords: 新的关键字列表（空列表 = 使用服务层默认关键字）。
         """
-        # 归一化 ROI：list/tuple -> tuple；非法其他值 -> None
-        normalized = None
-        if roi is not None and isinstance(roi, (list, tuple)) and len(roi) == 4:
-            try:
-                normalized = (int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
-            except (TypeError, ValueError):
-                normalized = None
+        if self._config is None:
+            return
 
-        # 1. 同步到 DroneMonitor
+        new_keywords = list(keywords) if keywords else []
+        # 配置持久化（仅在变化时写盘）
+        if self._config.monitor.drone.drone_keywords != new_keywords:
+            self._config.monitor.drone.drone_keywords = new_keywords
+            if self._config_manager is not None:
+                self._config_manager.save(self._config)
+
+        # 即时下发到 DroneMonitorService（启动前后均生效）
         if self._drone_service is not None:
-            self._drone_service.set_drone_roi(normalized)
+            self._drone_service.set_drone_keywords(new_keywords)
 
-        # 2. 写入配置并保存
-        if self._config is not None:
-            try:
-                if self._config.monitor.drone.roi_rect != normalized:
-                    self._config.monitor.drone.roi_rect = normalized
-                    if self._config_manager is not None:
-                        self._config_manager.save(self._config)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"保存 drone.roi_rect 配置失败：{e}")
-
-        if normalized is None:
-            self._monitor_tab.append_log("INFO", "无人机监控区域已清除")
-        else:
-            L, T, R, B = normalized
-            self._monitor_tab.append_log(
-                "INFO",
-                f"无人机监控区域已保存：({L},{T}) → ({R},{B})  {R-L}×{B-T}px"
-            )
+        desc = "、".join(new_keywords) if new_keywords else "默认关键字"
+        self._monitor_tab.append_log(
+            "INFO", f"无人机关键字已更新：{desc}"
+        )
 
     @pyqtSlot(list)
     def _on_translate_channels_changed(self, channels: list) -> None:
