@@ -27,17 +27,21 @@ class BaseService(QThread):
     后台服务基类。
 
     对外信号（UI 层订阅这些信号即可，无需关心服务内部实现）：
-        sig_log(str, str):    日志信号，参数为 (级别, 内容)，
-                              级别取值 "INFO" / "WARNING" / "ERROR" 等
-        sig_error(str):       错误信号，参数为错误描述，UI 收到后显示红色日志
-        sig_finished(str):    结束信号，参数为服务名，UI 可据此更新状态
+        sig_log(str, str):           日志信号，参数为 (级别, 内容)，
+                                     级别取值 "INFO" / "WARNING" / "ERROR" 等
+        sig_error(str):              错误信号，参数为错误描述，UI 收到后显示红色日志
+        sig_finished(str):           结束信号，参数为服务名，UI 可据此更新状态
+        sig_status_updated(str):     状态更新信号（对应提示词 status_updated），参数为状态描述
+        sig_alert_triggered(str):    通用预警信号（对应 alert_triggered），参数为预警描述文本
     """
 
     # ---- Qt 信号定义 ----
     # pyqtSignal(参数类型...)：声明一个可携带参数的信号
-    sig_log = pyqtSignal(str, str)      # (日志级别, 日志内容)
-    sig_error = pyqtSignal(str)         # (错误信息)
-    sig_finished = pyqtSignal(str)      # (服务名称)
+    sig_log = pyqtSignal(str, str)           # (日志级别, 日志内容)
+    sig_error = pyqtSignal(str)              # (错误信息)
+    sig_finished = pyqtSignal(str)           # (服务名称)
+    sig_status_updated = pyqtSignal(str)     # (状态描述，对应提示词 status_updated)
+    sig_alert_triggered = pyqtSignal(str)    # (预警描述文本，对应 alert_triggered)
 
     def __init__(self, service_name: str, parent=None):
         """
@@ -96,7 +100,7 @@ class BaseService(QThread):
         """
         return self.wait(timeout_ms)
 
-    # ---- 供子类使用的便捷方法：发日志 / 发错误 ----
+    # ---- 供子类使用的便捷方法：发日志 / 发错误 / 发状态 / 发预警 ----
     def emit_log(self, level: str, message: str) -> None:
         """发送一条日志信号给 UI（跨线程安全，Qt 信号天然支持）。"""
         self.sig_log.emit(level, message)
@@ -104,6 +108,14 @@ class BaseService(QThread):
     def emit_error(self, message: str) -> None:
         """发送一条错误信号给 UI。"""
         self.sig_error.emit(message)
+
+    def emit_status(self, status: str) -> None:
+        """发送一条状态更新信号给 UI（对应提示词 status_updated）。"""
+        self.sig_status_updated.emit(status)
+
+    def emit_alert(self, message: str) -> None:
+        """发送一条通用预警信号给 UI（对应 alert_triggered，承载描述文本）。"""
+        self.sig_alert_triggered.emit(message)
 
     # ---- 子类必须实现的方法 ----
     def run(self) -> None:

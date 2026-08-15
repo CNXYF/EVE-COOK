@@ -24,8 +24,10 @@ logger = get_logger("window_enumerator")
 # pywin32 只在 Windows 可导入，用 try 包裹给出友好报错
 try:
     import win32gui
+    import win32process
 except ImportError:
     win32gui = None
+    win32process = None
     logger.error("pywin32 未安装或非 Windows 系统，窗口枚举功能不可用")
 
 
@@ -36,9 +38,13 @@ class WindowInfo(NamedTuple):
     字段：
         hwnd: 窗口句柄（Windows 内部唯一编号，截图时用）
         title: 窗口标题（EVE 窗口标题通常含角色名）
+        pid: 进程ID（通过窗口句柄获取的对应进程PID，pywin32不可用时为0）
+        character_name: 角色名（从标题"EVE - 角色名"提取，不含分隔符则为空字符串）
     """
     hwnd: int
     title: str
+    pid: int = 0
+    character_name: str = ""
 
 
 class WindowEnumerator:
@@ -58,6 +64,25 @@ class WindowEnumerator:
             return []
 
         results: List[WindowInfo] = []
+
+        def _extract_character_name(title: str) -> str:
+            """
+            从窗口标题中提取角色名。
+
+            标题格式兼容：
+                - "EVE - 角色名"          → 提取 "角色名"
+                - "EVE Online - 角色名"   → 先去除 "EVE Online" 再提取 "角色名"
+                - 不含 "- " 的标题         → 返回空字符串
+            """
+            # 先去除 "EVE Online" 前缀（兼容写法）
+            processed = title.replace("EVE Online", "EVE", 1)
+            # 在处理后的标题中查找 "- " 分隔符
+            sep_index = processed.find("- ")
+            if sep_index != -1:
+                # 分隔符之后的部分即为角色名
+                return processed[sep_index + 2:].strip()
+            # 未找到分隔符，返回空字符串
+            return ""
 
         def _enum_callback(hwnd: int, _extra) -> bool:
             """
@@ -80,7 +105,24 @@ class WindowEnumerator:
                 title = win32gui.GetWindowText(hwnd)
                 # 标题包含 EVE 关键字即认为是 EVE 客户端窗口
                 if title and EVE_WINDOW_TITLE_KEYWORD in title:
-                    results.append(WindowInfo(hwnd=hwnd, title=title))
+                    # 获取进程ID：win32process 不可用时 pid 保持为 0
+                    pid = 0
+                    if win32process is not None:
+                        try:
+                            # GetWindowThreadProcessId 返回 (线程ID, 进程ID)，取第二个值
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug(f"获取窗口 {hwnd} 的PID失败：{e}")
+
+                    # 从标题提取角色名
+                    character_name = _extract_character_name(title)
+
+                    results.append(WindowInfo(
+                        hwnd=hwnd,
+                        title=title,
+                        pid=pid,
+                        character_name=character_name
+                    ))
 
             except Exception as e:  # noqa: BLE001 —— 回调禁止抛异常
                 # 某些窗口（如权限受限的系统窗口）读取标题会失败，跳过即可
@@ -96,3 +138,14 @@ class WindowEnumerator:
 
         logger.info(f"找到 {len(results)} 个 EVE 窗口")
         return results
+
+    def scan_once(self) -> List[WindowInfo]:
+        """
+        便捷方法：执行一次窗口扫描，等价于调用 enumerate_eve_windows()。
+
+        此方法作为更直观的对外别名，保留 enumerate_eve_windows() 作为底层实现。
+
+        返回：
+            List[WindowInfo]: 匹配到的 EVE 窗口列表
+        """
+        return self.enumerate_eve_windows()

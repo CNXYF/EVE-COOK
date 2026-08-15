@@ -15,6 +15,29 @@ from typing import List
 
 
 @dataclass
+class AlertConfig:
+    """
+    预警相关的配置项。
+
+    字段说明：
+        home_system: 当前星系名，用于判断跳数
+        jump_range: 跳数预警范围，敌对出现在多少跳以内时触发预警
+        alert_window_minutes: 预警时间窗口（分钟），超过该时间的旧报告不再预警
+        show_overlay: 是否显示悬浮预警窗口
+        voice_system_warning: 是否播放星系预警语音（敌对进入预警范围）
+        voice_local_warning: 是否播放本地预警语音（本地频道出现敌对）
+        voice_drone_warning: 是否播放无人机预警语音（被无人机锁定）
+    """
+    home_system: str = ""                          # 当前星系
+    jump_range: int = 6                            # 跳数预警范围
+    alert_window_minutes: int = 20                 # 预警时间窗口（分钟）
+    show_overlay: bool = True                      # 显示悬浮预警
+    voice_system_warning: bool = True              # 星系预警语音
+    voice_local_warning: bool = True               # 本地预警语音
+    voice_drone_warning: bool = True               # 无人机预警语音
+
+
+@dataclass
 class MonitorConfig:
     """
     监控相关的配置项。
@@ -27,11 +50,17 @@ class MonitorConfig:
                         空列表表示监控除本地外的所有频道
         danger_keywords: Intel 频道需要预警的危险关键字列表
         enable_voice: 是否开启语音播报
+        hostile_list: 敌对角色名列表，用于精确匹配预警目标
+        translation_channels: 需要翻译的频道名列表
+        alert: 预警子配置（跳数范围、时间窗口、语音开关等）
     """
-    eve_log_dir: str = ""                                  # EVE 日志目录路径
-    intel_channels: List[str] = field(default_factory=list)   # Intel 频道名单
-    danger_keywords: List[str] = field(default_factory=list)  # 危险关键字列表
-    enable_voice: bool = True                              # 是否开启语音
+    eve_log_dir: str = ""                                         # EVE 日志目录路径
+    intel_channels: List[str] = field(default_factory=list)       # Intel 频道名单
+    danger_keywords: List[str] = field(default_factory=list)      # 危险关键字列表
+    enable_voice: bool = True                                     # 是否开启语音
+    hostile_list: List[str] = field(default_factory=list)         # 敌对角色名列表
+    translation_channels: List[str] = field(default_factory=list) # 需要翻译的频道名
+    alert: AlertConfig = field(default_factory=AlertConfig)       # 预警子配置
 
 
 @dataclass
@@ -69,9 +98,13 @@ class AppConfig:
         采用"宽容解析"：字典里缺某个键时使用默认值，
         避免旧版本配置文件缺少新字段时直接报错。
         """
-        monitor_data = data.get("monitor", {})
-        ui_data = data.get("ui", {})
+        monitor_data = data.get("monitor", {}) or {}
+        ui_data = data.get("ui", {}) or {}
+
+        alert_data = monitor_data.get("alert", {}) or {}
+        monitor_data["alert"] = AlertConfig(**alert_data)
+
         return cls(
-            monitor=MonitorConfig(**monitor_data) if monitor_data else MonitorConfig(),
-            ui=UiConfig(**ui_data) if ui_data else UiConfig(),
+            monitor=MonitorConfig(**monitor_data),
+            ui=UiConfig(**ui_data),
         )

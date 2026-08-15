@@ -10,10 +10,17 @@
     2. 创建 QApplication（Qt 程序的"总开关"，必须最先创建）
     3. 加载 QSS 样式文件（深色科技风）
     4. 加载配置（ConfigManager）
-    5. 创建核心引擎（LogWatcher / AudioManager）
+    5. 创建核心引擎（LogWatcher / AudioManager / SdeLoader / JumpCalculator）
     6. 创建并注册各后台服务（ServiceManager 统一管理）
-    7. 创建主窗口并完成信号接线
+       - 先创建 JumpCalculator 并 build_graph（失败只记录日志，不影响启动）
+       - 各服务实例化时传入配置中对应的参数（敌对名单、音频、跳数等）
+    7. 创建三个 Tab（监控 / 翻译 / 跳数）与主窗口，主窗口内部自己组装 Tab
     8. 进入 Qt 事件循环（程序开始运行）
+
+    注意：
+    - 服务默认不自动 start_all（避免未经用户同意读取日志），
+      由用户在界面点击"开始监控"按钮启动。
+    - 窗口关闭时 MainWindow.closeEvent 已做 stop_all，这里保留兜底清理。
 ============================================================
 """
 import sys
@@ -29,8 +36,10 @@ if str(SRC_DIR) not in sys.path:
 from PyQt5.QtWidgets import QApplication  # noqa: E402 —— 必须在 sys.path 设置后导入
 
 from core.audio_manager import AudioManager      # noqa: E402
+from core.jump_calculator import JumpCalculator  # noqa: E402
 from core.log_watcher import LogWatcher          # noqa: E402
 from data.config_manager import ConfigManager    # noqa: E402
+from data.sde_loader import SdeLoader            # noqa: E402
 from services.drone_monitor import DroneMonitorService        # noqa: E402
 from services.intel_monitor import IntelMonitorService        # noqa: E402
 from services.local_monitor import LocalMonitorService        # noqa: E402
@@ -102,25 +111,88 @@ def main() -> None:
     audio_manager = AudioManager()           # 音频/TTS 管理器
     audio_manager.set_enabled(config.monitor.enable_voice)
 
-    # ---- 第 6 步：创建并注册后台服务 ----
-    service_manager = ServiceManager()
-    service_manager.register(LocalMonitorService(log_watcher))
-    service_manager.register(
-        IntelMonitorService(
-            log_watcher,
-            audio_manager,
-            config.monitor.danger_keywords,
-            config.monitor.intel_channels,
-        )
-    )
-    service_manager.register(DroneMonitorService())
-    service_manager.register(TranslationService())
+    # ---- 第 5.5 步：创建 SDE 加载器 + 跳数计算器（提前构建星图）----
+    # build_graph 成功与否不影响程序启动，失败只记录日志
+    sde_loader = SdeLoader()
+    jump_calculator = JumpCalculator(sde_loader)
+    try:
+        graph_ok = jump_calculator.build_graph()
+        if graph_ok:
+            logger.info("跳数计算器星图构建成功")
+        else:
+            logger.warning("跳数计算器星图构建失败（SDE 数据为空），跳数预警功能将不可用")
+    except Exception as e:  # noqa: BLE001 —— 星图构建失败不阻塞启动
+        logger.warning(f"跳数计算器星图构建异常（已忽略）：{e}")
+        jump_calculator = None  # 失败后置 None，IntelMonitor 内部会跳过跳数功能
 
-    # ---- 第 7 步：创建主窗口（内部完成信号接线） ----
-    window = MainWindow(service_manager)
+    # ---- 第 6 步：创建并注册后台服务（带完整配置参数）----
+    # 说明：
+    #   - 先把四个服务实例保存到局部变量，方便后续传给 MainWindow 连接信号
+    #   - 每个服务实例化时按最新配置传入敌对名单、音频、跳数、语音开关等
+    service_manager = ServiceManager()
+
+    # 6a) LocalMonitor：传入 hostile_list + audio_manager + voice_local_warning
+    local_service = LocalMonitorService(
+        log_watcher=log_watcher,
+        hostile_list=config.monitor.hostile_list,
+        audio_manager=audio_manager,
+        voice_enabled=config.monitor.alert.voice_local_warning,
+    )
+    service_manager.register(local_service)
+
+    # 6b) IntelMonitor：传入 jump_calculator + home_system + jump_range + voice_system_warning
+    intel_service = IntelMonitorService(
+        log_watcher=log_watcher,
+        audio_manager=audio_manager,
+        danger_keywords=config.monitor.danger_keywords,
+        intel_channels=config.monitor.intel_channels,
+        jump_calculator=jump_calculator,
+        home_system=config.monitor.alert.home_system,
+        jump_range=config.monitor.alert.jump_range,
+        voice_enabled=config.monitor.alert.voice_system_warning,
+    )
+    service_manager.register(intel_service)
+
+    # 6c) DroneMonitor：传入 audio_manager + voice_drone_warning
+    drone_service = DroneMonitorService(
+        audio_manager=audio_manager,
+        voice_enabled=config.monitor.alert.voice_drone_warning,
+    )
+    service_manager.register(drone_service)
+
+    # 6d) TranslationService：在创建 TranslateTab 前先注册好（传 log_watcher + translation_channels + audio_manager）
+    translation_service = TranslationService(
+        log_watcher=log_watcher,
+        target_channels=config.monitor.translation_channels,
+        audio_manager=audio_manager,
+    )
+    service_manager.register(translation_service)
+
+    # ---- 第 7 步：创建主窗口（内部完成 Tab 组装 + 信号接线）----
+    # 说明：
+    #   - MainWindow.__init__ 内部会自己创建 monitor_tab / translate_tab / jump_tab
+    #     并按顺序 ("EVE-COOK", "频道翻译", "跳数计算") 添加到 QTabWidget，
+    #     这里只需把各服务引用 + 配置引用传入，供其连接信号用。
+    #   - 保持 monitor_tab / jump_tab / translate_tab 依赖的服务先创建完毕。
+    window = MainWindow(
+        service_manager=service_manager,
+        local_service=local_service,
+        intel_service=intel_service,
+        drone_service=drone_service,
+        translation_service=translation_service,
+        config_manager=config_manager,
+        config=config,
+        audio_manager=audio_manager,
+        alert_overlay=None,  # None 表示让 MainWindow 内部自行创建 AlertOverlay
+    )
     window.show()
 
-    logger.info(f"{APP_NAME} 启动完成，进入事件循环")
+    # 说明：服务默认不自动 start_all（避免未经用户同意读取日志），
+    # 由用户点击界面上的"开始监控"按钮后启动。
+    logger.info(
+        f"{APP_NAME} 启动完成，进入事件循环。"
+        f"提示：请在界面点击『开始监控』按钮启动各项后台服务（默认不自动启动，保护您的日志隐私）"
+    )
 
     # ---- 第 8 步：进入 Qt 事件循环 ----
     # exec_() 会一直运行，直到窗口关闭；返回值作为进程退出码

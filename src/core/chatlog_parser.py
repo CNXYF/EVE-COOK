@@ -20,7 +20,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Iterable
 
 from utils.logger import get_logger
 
@@ -43,6 +43,30 @@ SYSTEM_SENDERS = {"EVE系统", "EVE System"}
 _LOCAL_CHANGE_PREFIX_CN = "频道更换为本地："
 _LOCAL_CHANGE_PREFIX_EN = "Channel changed to Local: "
 
+# ---------- 进出星系事件正则 ----------
+# 国服格式："玩家 进入星系 某某星系" / "玩家 离开星系 某某星系"
+_LOCAL_EVENT_PATTERN_CN = re.compile(
+    r"^(?P<player>.+?)\s+(?P<type>进入|离开)星系\s+(?P<system>.+?)$"
+)
+# 欧服格式："Player has entered system XXX" / "Player has left the system XXX"
+_LOCAL_EVENT_ENTER_PATTERN_EN = re.compile(
+    r"^(?P<player>.+?)\s+has entered system\s+(?P<system>.+?)$"
+)
+_LOCAL_EVENT_LEAVE_PATTERN_EN = re.compile(
+    r"^(?P<player>.+?)\s+has left the system\s+(?P<system>.+?)$"
+)
+
+# ---------- 星系 ID 代号正则（EVE 空星系编号形态多样化）----------
+# 典型格式：OBK-K8（3-2）、GE-8JV（2-3）、6-CZ49（1-5）、H-5GU（1-4）、1DQ1-A（4-1）
+# 规则：
+#   左半 1~6 字母数字 + 连字符 + 右半 1~6 字母数字
+#   整体前后两侧不能紧邻字母数字（保证是"一个词"而不是长片段的中间）
+#   末尾可选跟 *（星系名高亮标记），结果里不包含 *
+_SYSTEM_ID_PATTERN = re.compile(
+    r"(?<![A-Z0-9])[A-Z0-9]{1,6}-[A-Z0-9]{1,6}(?=\*)?(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ChatMessage:
@@ -64,6 +88,21 @@ class ChatMessage:
     def is_system(self) -> bool:
         """是否为系统消息（发送者是 EVE系统/EVE System）。"""
         return self.sender in SYSTEM_SENDERS
+
+
+@dataclass
+class LocalEvent:
+    """
+    本地频道进出星系事件的数据结构。
+
+    字段：
+        type:   事件类型，"enter" 表示进入星系，"leave" 表示离开星系
+        player: 触发事件的玩家名称
+        system: 星系名称
+    """
+    type: str
+    player: str
+    system: str
 
 
 def parse_line(line: str, channel: str = "") -> Optional[ChatMessage]:
@@ -142,3 +181,92 @@ def extract_local_system(content: str) -> Optional[str]:
             # EVE 在星系名后附加 * 号（表示主权星系），去掉得到纯星系名
             return system_name.rstrip("*").strip()
     return None
+
+
+def extract_local_event(message: ChatMessage) -> Optional[LocalEvent]:
+    """
+    从系统消息中解析进出星系事件。
+
+    仅在 message.is_system 为 True 时尝试解析，否则直接返回 None。
+    支持国服和欧服两种消息格式。
+
+    参数：
+        message: 聊天消息对象
+
+    返回：
+        LocalEvent: 解析成功时返回事件对象（type 为 "enter"/"leave"）
+        None: 非系统消息或不是进出事件时返回
+    """
+    if not message.is_system:
+        return None
+
+    content = message.content.strip()
+
+    # ---- 国服格式：玩家 进入/离开星系 星系名 ----
+    match = _LOCAL_EVENT_PATTERN_CN.match(content)
+    if match:
+        event_type = "enter" if match.group("type") == "进入" else "leave"
+        return LocalEvent(
+            type=event_type,
+            player=match.group("player").strip(),
+            system=match.group("system").strip().rstrip("*"),
+        )
+
+    # ---- 欧服格式：进入事件 ----
+    match = _LOCAL_EVENT_ENTER_PATTERN_EN.match(content)
+    if match:
+        return LocalEvent(
+            type="enter",
+            player=match.group("player").strip(),
+            system=match.group("system").strip().rstrip("*"),
+        )
+
+    # ---- 欧服格式：离开事件 ----
+    match = _LOCAL_EVENT_LEAVE_PATTERN_EN.match(content)
+    if match:
+        return LocalEvent(
+            type="leave",
+            player=match.group("player").strip(),
+            system=match.group("system").strip().rstrip("*"),
+        )
+
+    return None
+
+
+def match_hostile(players: Iterable[str], hostile_list: Iterable[str]) -> List[str]:
+    """
+    不区分大小写比对玩家列表与敌对名单，返回匹配到的敌对子集。
+
+    匹配规则：双方均转为小写后比对，返回结果保留 players 中的原始大小写。
+    若同一玩家（忽略大小写）在 players 中出现多次，结果中也会保留多次。
+
+    参数：
+        players:      待检测的玩家名称集合
+        hostile_list: 敌对玩家名单
+
+    返回：
+        List[str]: 匹配到的敌对玩家列表（来自 players，保留原始大小写）
+    """
+    hostile_lower = {name.lower() for name in hostile_list}
+    result: List[str] = []
+    for player in players:
+        if player.lower() in hostile_lower:
+            result.append(player)
+    return result
+
+
+def extract_system_names_from_text(content: str) -> List[str]:
+    """
+    从 intel 文本中初步提取星系 ID 代号。
+
+    提取规则：匹配形如 [A-Z]{3}-[A-Z0-9]{3} 的星系代号（如 OBK-K8），
+    允许末尾带可选的 * 号（但结果中不包含 *），返回匹配到的大写字符串列表。
+
+    参数：
+        content: 任意文本内容（如玩家聊天发送的 intel 报告）
+
+    返回：
+        List[str]: 匹配到的星系 ID 列表（大写，按出现顺序，不自动去重）
+    """
+    matches = _SYSTEM_ID_PATTERN.findall(content)
+    return [m.upper() for m in matches]

@@ -1,105 +1,555 @@
 """
 ============================================================
-模块：ui/tabs/monitor_tab.py —— 监控选项卡
+模块：ui/tabs/monitor_tab.py —— 监控中心选项卡
 ------------------------------------------------------------
 功能说明：
-    主窗口的核心页面：
-    - 上半部分：Local/Intel 监控状态与启停按钮
-    - 下半部分：分级着色的日志显示区（LogViewer）
+    主窗口核心页面「监控中心」，采用 QSplitter 左右分栏布局：
+    - 左栏：控制按钮 + 预警参数 + 提醒开关 + 窗口列表表格
+    - 右栏：状态行 + 事件日志 + 视觉预览
 
     UI 层职责约束：
     - 本文件只负责"画界面 + 发信号"
-    - 点击按钮 -> 发射信号，由主窗口/服务层处理
-    - 日志通过槽函数被动接收，不主动拉取
+    - 点击按钮/切换配置 -> 发射信号，由主窗口/服务层处理
+    - 日志/状态通过槽函数被动接收，不主动拉取
 ============================================================
 """
-from PyQt5.QtCore import pyqtSignal
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPixmap, QTextCharFormat, QTextCursor
 from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from ui.widgets.log_viewer import LogViewer
+from core.window_enumerator import WindowInfo
+from utils.constants import (
+    COLOR_ERROR,
+    COLOR_INFO,
+    COLOR_WARN,
+    COLOR_TEXT,
+)
 
 
 class MonitorTab(QWidget):
     """
-    监控选项卡页面。
+    监控中心选项卡页面。
 
-    对外信号：
-        sig_start_clicked(): 用户点击"启动监控"按钮
-        sig_stop_clicked():  用户点击"停止监控"按钮
+    对外信号（由主窗口连接到服务层）：
+        sig_start_all():            点击"开始监控"
+        sig_stop_all():             点击"停止监控"
+        sig_scan_once():            点击"扫描一次"
+        sig_local_check():          点击"本地检查"
+        sig_drone_check():          点击"无人机检查"
+        sig_refresh_preview():      点击"刷新预览"
+        sig_config_changed(dict):   预警配置/提醒开关变化（发射完整配置字典）
     """
 
-    sig_start_clicked = pyqtSignal()
-    sig_stop_clicked = pyqtSignal()
+    # ---------- 新增 Qt 信号 ----------
+    sig_start_clicked = pyqtSignal()  # 旧版兼容
+    sig_stop_clicked = pyqtSignal()   # 旧版兼容
+    sig_start_all = pyqtSignal()
+    sig_stop_all = pyqtSignal()
+    sig_scan_once = pyqtSignal()
+    sig_local_check = pyqtSignal()
+    sig_drone_check = pyqtSignal()
+    sig_refresh_preview = pyqtSignal()
+    sig_config_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None):
-        """构建监控页界面。"""
+        """构建监控中心页界面。"""
         super().__init__(parent)
         self._build_ui()
+        self._connect_internal_signals()
 
+    # ============================================================
+    #  界面构建
+    # ============================================================
     def _build_ui(self) -> None:
         """搭建界面控件与布局（纯界面代码，无业务逻辑）。"""
-        # 根布局：垂直方向，从上到下排列
-        root_layout = QVBoxLayout(self)
+        # 根布局：一个水平 QSplitter，左右分栏
+        root_splitter = QSplitter(Qt.Horizontal, self)
+        root_splitter.setObjectName("monitorRootSplitter")
+        root_splitter.setHandleWidth(2)
 
-        # ---- 顶部：状态行 + 控制按钮 ----
-        control_layout = QHBoxLayout()
+        # 左栏容器 + 右栏容器
+        left_panel = self._build_left_panel()
+        right_panel = self._build_right_panel()
 
-        # 状态标签：显示当前监控运行状态
-        self._status_label = QLabel("监控状态：未启动")
-        self._status_label.setObjectName("statusLabel")
-        control_layout.addWidget(self._status_label)
+        root_splitter.addWidget(left_panel)
+        root_splitter.addWidget(right_panel)
+        root_splitter.setStretchFactor(0, 4)   # 左栏占 4 份
+        root_splitter.setStretchFactor(1, 6)   # 右栏占 6 份
 
-        # 当前星系标签：显示 Local 监控追踪到的当前星系
-        self._system_label = QLabel("当前星系：未知")
-        self._system_label.setObjectName("systemLabel")
-        control_layout.addWidget(self._system_label)
+        # 把 splitter 铺满整个 Tab
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(4, 4, 4, 4)
+        outer_layout.addWidget(root_splitter)
 
-        control_layout.addStretch()  # 弹性空白，把按钮推到右侧
+    def _build_left_panel(self) -> QWidget:
+        """构建左栏：控制按钮 + 预警配置 + 提醒开关 + 窗口列表。"""
+        panel = QWidget(self)
+        panel.setObjectName("leftPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
 
-        # 启动按钮：点击后发射 sig_start_clicked 信号
-        self._start_button = QPushButton("启动监控")
-        self._start_button.clicked.connect(self.sig_start_clicked.emit)
-        control_layout.addWidget(self._start_button)
+        # ---- 顶部：控制按钮组（Grid 两排三列） ----
+        btn_group_box = QGroupBox("控制区", panel)
+        btn_group_box.setObjectName("controlGroupBox")
+        grid = QGridLayout(btn_group_box)
+        grid.setSpacing(6)
 
-        # 停止按钮：初始禁用（未启动时不能停止）
-        self._stop_button = QPushButton("停止监控")
-        self._stop_button.setEnabled(False)
-        self._stop_button.clicked.connect(self.sig_stop_clicked.emit)
-        control_layout.addWidget(self._stop_button)
+        self.btn_scan_once = QPushButton("扫描一次", btn_group_box)
+        self.btn_scan_once.setObjectName("btn_scan_once")
+        grid.addWidget(self.btn_scan_once, 0, 0)
 
-        root_layout.addLayout(control_layout)
+        self.btn_local_check = QPushButton("本地检查", btn_group_box)
+        self.btn_local_check.setObjectName("btn_local_check")
+        grid.addWidget(self.btn_local_check, 0, 1)
 
-        # ---- 下部：日志显示区 ----
-        self.log_viewer = LogViewer(self)
-        root_layout.addWidget(self.log_viewer)
+        self.btn_drone_check = QPushButton("无人机检查", btn_group_box)
+        self.btn_drone_check.setObjectName("btn_drone_check")
+        grid.addWidget(self.btn_drone_check, 0, 2)
 
-    def set_current_system(self, system_name: str) -> None:
+        self.btn_refresh_preview = QPushButton("刷新预览", btn_group_box)
+        self.btn_refresh_preview.setObjectName("btn_refresh_preview")
+        grid.addWidget(self.btn_refresh_preview, 1, 0)
+
+        self.btn_start = QPushButton("开始监控", btn_group_box)
+        self.btn_start.setObjectName("btn_start")
+        grid.addWidget(self.btn_start, 1, 1)
+
+        self.btn_stop = QPushButton("停止监控", btn_group_box)
+        self.btn_stop.setObjectName("btn_stop")
+        self.btn_stop.setEnabled(False)  # 初始未启动，停止按钮禁用
+        grid.addWidget(self.btn_stop, 1, 2)
+
+        layout.addWidget(btn_group_box)
+
+        # ---- 中部：预警参数配置 ----
+        cfg_group = QGroupBox("预警参数", panel)
+        cfg_group.setObjectName("alertConfigGroupBox")
+        form = QFormLayout(cfg_group)
+        form.setSpacing(8)
+
+        self.line_home_system = QLineEdit(cfg_group)
+        self.line_home_system.setObjectName("line_home_system")
+        self.line_home_system.setPlaceholderText("如 Jita")
+        form.addRow("当前星系：", self.line_home_system)
+
+        self.spin_jump_range = QSpinBox(cfg_group)
+        self.spin_jump_range.setObjectName("spin_jump_range")
+        self.spin_jump_range.setRange(1, 50)
+        self.spin_jump_range.setValue(6)
+        self.spin_jump_range.setSuffix(" 跳")
+        form.addRow("跳数范围：", self.spin_jump_range)
+
+        self.spin_alert_minutes = QSpinBox(cfg_group)
+        self.spin_alert_minutes.setObjectName("spin_alert_minutes")
+        self.spin_alert_minutes.setRange(1, 240)
+        self.spin_alert_minutes.setValue(20)
+        self.spin_alert_minutes.setSuffix(" 分钟")
+        form.addRow("预警时间：", self.spin_alert_minutes)
+
+        layout.addWidget(cfg_group)
+
+        # ---- 提醒开关区 ----
+        switch_group = QGroupBox("提醒开关", panel)
+        switch_group.setObjectName("alertSwitchGroupBox")
+        switch_layout = QVBoxLayout(switch_group)
+        switch_layout.setSpacing(6)
+
+        self.chk_show_overlay = QCheckBox("显示悬浮预警", switch_group)
+        self.chk_show_overlay.setObjectName("chk_show_overlay")
+        self.chk_show_overlay.setChecked(True)
+        switch_layout.addWidget(self.chk_show_overlay)
+
+        self.chk_voice_system = QCheckBox("星系预警语音", switch_group)
+        self.chk_voice_system.setObjectName("chk_voice_system")
+        self.chk_voice_system.setChecked(True)
+        switch_layout.addWidget(self.chk_voice_system)
+
+        self.chk_voice_local = QCheckBox("本地预警语音", switch_group)
+        self.chk_voice_local.setObjectName("chk_voice_local")
+        self.chk_voice_local.setChecked(True)
+        switch_layout.addWidget(self.chk_voice_local)
+
+        self.chk_voice_drone = QCheckBox("无人机预警语音", switch_group)
+        self.chk_voice_drone.setObjectName("chk_voice_drone")
+        self.chk_voice_drone.setChecked(True)
+        switch_layout.addWidget(self.chk_voice_drone)
+
+        layout.addWidget(switch_group)
+
+        # ---- 底部：窗口列表表格 ----
+        table_box = QGroupBox("游戏窗口列表", panel)
+        table_box.setObjectName("windowsGroupBox")
+        table_layout = QVBoxLayout(table_box)
+        table_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.table_windows = QTableWidget(0, 6, table_box)
+        self.table_windows.setObjectName("table_windows")
+        self.table_windows.setHorizontalHeaderLabels(
+            ["✓", "角色名", "进程ID", "句柄", "本地检测", "无人机检测"]
+        )
+        # 表头自适应与拉伸
+        header = self.table_windows.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        # 行选中高亮（QSS 已定义）
+        self.table_windows.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_windows.setSelectionMode(QTableWidget.SingleSelection)
+        self.table_windows.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_windows.verticalHeader().setVisible(False)
+
+        table_layout.addWidget(self.table_windows)
+        layout.addWidget(table_box, stretch=1)
+
+        return panel
+
+    def _build_right_panel(self) -> QWidget:
+        """构建右栏：状态行 + 事件日志 + 视觉预览。"""
+        panel = QWidget(self)
+        panel.setObjectName("rightPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # ---- 顶部：状态行（横向） ----
+        status_bar = QHBoxLayout()
+        status_bar.setSpacing(16)
+
+        self.lbl_status = QLabel("监控状态：未启动", panel)
+        self.lbl_status.setObjectName("statusLabel")
+        status_bar.addWidget(self.lbl_status)
+
+        self.lbl_system = QLabel("当前星系：未知", panel)
+        self.lbl_system.setObjectName("systemLabel")
+        status_bar.addWidget(self.lbl_system)
+
+        self.lbl_alert = QLabel("预警级别：-", panel)
+        self.lbl_alert.setObjectName("alertLevelLabel")
+        status_bar.addWidget(self.lbl_alert)
+
+        status_bar.addStretch(1)  # 右侧弹性空白
+        layout.addLayout(status_bar)
+
+        # ---- 中部：事件日志 ----
+        log_box = QGroupBox("事件日志", panel)
+        log_box.setObjectName("eventLogGroupBox")
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.evt_log = QPlainTextEdit(log_box)
+        self.evt_log.setObjectName("evt_log")
+        self.evt_log.setReadOnly(True)
+        self.evt_log.setFont(QFont("Consolas", 10))
+        self.evt_log.setMaximumBlockCount(1000)
+        log_layout.addWidget(self.evt_log)
+
+        layout.addWidget(log_box, stretch=1)
+
+        # ---- 底部：视觉预览 ----
+        preview_box = QGroupBox("视觉预览", panel)
+        preview_box.setObjectName("previewGroupBox")
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.preview_label = QLabel("暂无预览", preview_box)
+        self.preview_label.setObjectName("preview_label")
+        self.preview_label.setFixedSize(360, 240)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        # 边框样式：1px #1a2a2a
+        self.preview_label.setStyleSheet(
+            "QLabel#preview_label {"
+            "  border: 1px solid #1a2a2a;"
+            "  background-color: #0d1219;"
+            "  color: #555b63;"
+            "}"
+        )
+        preview_layout.addWidget(self.preview_label, 0, Qt.AlignHCenter)
+
+        layout.addWidget(preview_box)
+
+        return panel
+
+    # ============================================================
+    #  内部信号连接（控件 -> 对外信号）
+    # ============================================================
+    def _connect_internal_signals(self) -> None:
+        """连接按钮点击与配置控件变化 -> 对外发射信号。"""
+        # 按钮组 -> 无参信号
+        self.btn_scan_once.clicked.connect(self.sig_scan_once.emit)
+        self.btn_local_check.clicked.connect(self.sig_local_check.emit)
+        self.btn_drone_check.clicked.connect(self.sig_drone_check.emit)
+        self.btn_refresh_preview.clicked.connect(self.sig_refresh_preview.emit)
+        self.btn_start.clicked.connect(self.sig_start_all.emit)
+        self.btn_start.clicked.connect(self.sig_start_clicked.emit)  # 旧版兼容
+        self.btn_stop.clicked.connect(self.sig_stop_all.emit)
+        self.btn_stop.clicked.connect(self.sig_stop_clicked.emit)    # 旧版兼容
+
+        # 预警配置变化 -> 发射配置字典
+        self.line_home_system.textChanged.connect(self._emit_config_changed)
+        self.spin_jump_range.valueChanged.connect(self._emit_config_changed)
+        self.spin_alert_minutes.valueChanged.connect(self._emit_config_changed)
+
+        # 提醒开关变化 -> 发射配置字典
+        self.chk_show_overlay.stateChanged.connect(self._emit_config_changed)
+        self.chk_voice_system.stateChanged.connect(self._emit_config_changed)
+        self.chk_voice_local.stateChanged.connect(self._emit_config_changed)
+        self.chk_voice_drone.stateChanged.connect(self._emit_config_changed)
+
+    def _emit_config_changed(self) -> None:
+        """汇总当前预警配置，通过 sig_config_changed 发射。"""
+        self.sig_config_changed.emit(self.get_monitor_config())
+
+    # ============================================================
+    #  对外公共方法
+    # ============================================================
+    def set_running(self, running: bool) -> None:
         """
-        刷新"当前星系"显示（供主窗口在收到星系变化信号后调用）。
+        刷新监控状态显示 & 按钮启用互斥。
 
         参数：
-            system_name: 新的星系名。
-        """
-        self._system_label.setText(f"当前星系：{system_name}")
-
-    def set_running_state(self, running: bool) -> None:
-        """
-        根据监控运行状态刷新界面（供主窗口调用）。
-
-        参数：
-            running: True 表示监控运行中。
+            running: True=监控运行中（禁用"开始"，启用"停止"）；False=未启动。
         """
         if running:
-            self._status_label.setText("监控状态：运行中")
-            self._start_button.setEnabled(False)  # 运行中不能再启动
-            self._stop_button.setEnabled(True)
+            self.lbl_status.setText("监控状态：运行中")
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
         else:
-            self._status_label.setText("监控状态：未启动")
-            self._start_button.setEnabled(True)
-            self._stop_button.setEnabled(False)
+            self.lbl_status.setText("监控状态：未启动")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+
+    def set_running_state(self, running: bool) -> None:
+        """set_running 的别名，保持旧版接口兼容。"""
+        self.set_running(running)
+
+    def set_current_system(self, system: str) -> None:
+        """
+        刷新"当前星系"显示标签。
+
+        参数：
+            system: 当前星系名称（空字符串或 None 显示"未知"）。
+        """
+        if system:
+            self.lbl_system.setText(f"当前星系：{system}")
+        else:
+            self.lbl_system.setText("当前星系：未知")
+
+    def set_alert_level(self, text: str, color: Optional[str] = None) -> None:
+        """
+        刷新"预警级别"显示标签。
+
+        参数：
+            text:  预警级别文字（如"安全"/"警惕"/"危险"）。
+            color: 可选，文字颜色 hex 值，不传则使用默认文字色。
+        """
+        self.lbl_alert.setText(f"预警级别：{text}")
+        if color:
+            self.lbl_alert.setStyleSheet(f"QLabel#alertLevelLabel {{ color: {color}; }}")
+        else:
+            self.lbl_alert.setStyleSheet(f"QLabel#alertLevelLabel {{ color: {COLOR_TEXT}; }}")
+
+    def append_log(self, level: str, text: str) -> None:
+        """
+        在事件日志区追加一条带时间戳的分级着色日志。
+
+        参数：
+            level: 日志级别（"INFO" / "WARNING" / "ERROR"，未知级别用默认色）。
+            text:  日志内容。
+        """
+        ts = datetime.now().strftime("%H:%M:%S")
+        level_upper = level.upper()
+
+        # 级别对应颜色映射
+        color_map = {
+            "ERROR": COLOR_ERROR,
+            "WARNING": COLOR_WARN,
+            "INFO": COLOR_INFO,
+        }
+        color = color_map.get(level_upper, COLOR_TEXT)
+
+        # 转义 HTML 特殊字符，防止日志内容破坏排版
+        safe_text = (
+            text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+        )
+
+        # 组装一行带颜色的 HTML 并追加显示
+        html = (
+            f'<span style="color:{COLOR_TEXT};">[{ts}]</span> '
+            f'<span style="color:{color};">[{level_upper}] {safe_text}</span>'
+        )
+        self.evt_log.appendHtml(html)
+
+    def set_windows(
+        self,
+        windows: List[WindowInfo],
+        monitored: Optional[Dict[int, bool]] = None,
+        local_enabled: Optional[Dict[int, bool]] = None,
+        drone_enabled: Optional[Dict[int, bool]] = None,
+    ) -> None:
+        """
+        刷新窗口列表表格。
+
+        参数：
+            windows:       WindowInfo 列表。
+            monitored:     {hwnd: bool} 指定哪些窗口勾选监控，默认空字典。
+            local_enabled: {hwnd: bool} 指定哪些窗口开启本地检测，默认空字典。
+            drone_enabled: {hwnd: bool} 指定哪些窗口开启无人机检测，默认空字典。
+        """
+        if monitored is None:
+            monitored = {}
+        if local_enabled is None:
+            local_enabled = {}
+        if drone_enabled is None:
+            drone_enabled = {}
+
+        # 清空旧行
+        self.table_windows.setRowCount(0)
+
+        for win in windows:
+            row = self.table_windows.rowCount()
+            self.table_windows.insertRow(row)
+
+            # 第 0 列：复选框
+            chk_item = QTableWidgetItem()
+            chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            if monitored.get(win.hwnd, False):
+                chk_item.setCheckState(Qt.Checked)
+            else:
+                chk_item.setCheckState(Qt.Unchecked)
+            self.table_windows.setItem(row, 0, chk_item)
+
+            # 第 1 列：角色名（从 WindowInfo 取，为空则显示窗口标题）
+            char_name = win.character_name if win.character_name else win.title
+            name_item = QTableWidgetItem(char_name)
+            name_item.setData(Qt.UserRole, win.hwnd)  # 把 hwnd 存到 UserRole 方便读取
+            self.table_windows.setItem(row, 1, name_item)
+
+            # 第 2 列：进程ID
+            pid_item = QTableWidgetItem(str(win.pid))
+            self.table_windows.setItem(row, 2, pid_item)
+
+            # 第 3 列：句柄（十六进制显示，更符合 Windows 习惯）
+            hwnd_item = QTableWidgetItem(f"0x{win.hwnd:X}")
+            self.table_windows.setItem(row, 3, hwnd_item)
+
+            # 第 4 列：本地检测（QComboBox：开启/关闭）
+            local_combo = QComboBox(self.table_windows)
+            local_combo.setObjectName(f"local_combo_{win.hwnd}")
+            local_combo.addItems(["开启", "关闭"])
+            local_combo.setCurrentIndex(0 if local_enabled.get(win.hwnd, True) else 1)
+            local_combo.currentIndexChanged.connect(self._emit_config_changed)
+            self.table_windows.setCellWidget(row, 4, local_combo)
+
+            # 第 5 列：无人机检测（QComboBox：开启/关闭）
+            drone_combo = QComboBox(self.table_windows)
+            drone_combo.setObjectName(f"drone_combo_{win.hwnd}")
+            drone_combo.addItems(["开启", "关闭"])
+            drone_combo.setCurrentIndex(0 if drone_enabled.get(win.hwnd, True) else 1)
+            drone_combo.currentIndexChanged.connect(self._emit_config_changed)
+            self.table_windows.setCellWidget(row, 5, drone_combo)
+
+    def set_preview_image(self, image_or_none: Optional[QPixmap]) -> None:
+        """
+        设置视觉预览图像。
+
+        参数：
+            image_or_none: QPixmap 则显示该图；None 则显示占位文字。
+        """
+        if image_or_none is None or image_or_none.isNull():
+            self.preview_label.clear()
+            self.preview_label.setText("暂无预览")
+        else:
+            # 按 label 尺寸缩放显示，保持比例
+            scaled = image_or_none.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.preview_label.clear()
+            self.preview_label.setPixmap(scaled)
+
+    def get_monitor_config(self) -> dict:
+        """
+        提取当前预警配置字典（与 sig_config_changed 发射内容一致）。
+
+        返回 dict 键：
+            home_system, jump_range, alert_window_minutes,
+            show_overlay, voice_system_warning, voice_local_warning, voice_drone_warning
+        """
+        return {
+            "home_system": self.line_home_system.text().strip(),
+            "jump_range": self.spin_jump_range.value(),
+            "alert_window_minutes": self.spin_alert_minutes.value(),
+            "show_overlay": self.chk_show_overlay.isChecked(),
+            "voice_system_warning": self.chk_voice_system.isChecked(),
+            "voice_local_warning": self.chk_voice_local.isChecked(),
+            "voice_drone_warning": self.chk_voice_drone.isChecked(),
+        }
+
+    def get_window_monitoring(self) -> Tuple[List[int], Dict[int, bool], Dict[int, bool]]:
+        """
+        返回当前表格中窗口的监控配置。
+
+        返回：
+            (checked_hwnd_list, local_map, drone_map)
+            - checked_hwnd_list: 勾选了监控的窗口句柄列表
+            - local_map:         {hwnd: bool} 本地检测是否开启
+            - drone_map:         {hwnd: bool} 无人机检测是否开启
+        """
+        checked_hwnds: List[int] = []
+        local_map: Dict[int, bool] = {}
+        drone_map: Dict[int, bool] = {}
+
+        for row in range(self.table_windows.rowCount()):
+            # 从第 1 列（角色名）的 UserRole 取回 hwnd
+            name_item = self.table_windows.item(row, 1)
+            if name_item is None:
+                continue
+            hwnd = name_item.data(Qt.UserRole)
+            if hwnd is None:
+                continue
+
+            # 第 0 列：复选框
+            chk_item = self.table_windows.item(row, 0)
+            if chk_item is not None and chk_item.checkState() == Qt.Checked:
+                checked_hwnds.append(hwnd)
+
+            # 第 4 列：本地检测 ComboBox
+            local_combo = self.table_windows.cellWidget(row, 4)
+            if isinstance(local_combo, QComboBox):
+                local_map[hwnd] = (local_combo.currentIndex() == 0)
+
+            # 第 5 列：无人机检测 ComboBox
+            drone_combo = self.table_windows.cellWidget(row, 5)
+            if isinstance(drone_combo, QComboBox):
+                drone_map[hwnd] = (drone_combo.currentIndex() == 0)
+
+        return checked_hwnds, local_map, drone_map

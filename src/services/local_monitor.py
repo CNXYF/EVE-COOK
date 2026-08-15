@@ -21,12 +21,16 @@
 ============================================================
 """
 from pathlib import Path
+from typing import List, Optional
 
 from PyQt5.QtCore import pyqtSignal
 
+from core.audio_manager import AudioManager
 from core.chatlog_parser import (
     channel_name_from_file,
+    extract_local_event,
     extract_local_system,
+    match_hostile,
     parse_line,
 )
 from core.log_watcher import LogWatcher
@@ -46,6 +50,8 @@ class LocalMonitorService(BaseService):
                                  UI 收到后刷新"当前星系"显示。
         sig_local_message(str, str): 本地频道发言信号，
                                      参数为 (发言人, 内容)。
+        sig_alert_triggered(str): 继承自 BaseService，用于本地敌对预警，
+                                  参数为预警描述文本（如"[Local 敌对预警] 玩家 XXX 进入星系 YYY"）。
     """
 
     # 当前星系变化信号（携带星系名）
@@ -53,14 +59,27 @@ class LocalMonitorService(BaseService):
     # 本地频道发言信号（携带 发言人、内容）
     sig_local_message = pyqtSignal(str, str)
 
-    def __init__(self, log_watcher: LogWatcher, parent=None):
+    def __init__(
+        self,
+        log_watcher: LogWatcher,
+        hostile_list: List[str] = None,
+        audio_manager: Optional[AudioManager] = None,
+        voice_enabled: bool = True,
+        parent=None,
+    ):
         """
         参数：
-            log_watcher: core 层的日志监视器实例（由外部注入，便于复用）
-            parent: Qt 父对象
+            log_watcher:   core 层的日志监视器实例（由外部注入，便于复用）
+            hostile_list:  敌对玩家名单列表（默认为空列表）
+            audio_manager: 音频管理器实例（可选，默认为 None；用于 TTS 语音预警）
+            voice_enabled: 是否启用语音播报（仅在 audio_manager 存在时生效）
+            parent:        Qt 父对象
         """
         super().__init__(service_name="LocalMonitor", parent=parent)
         self._log_watcher = log_watcher
+        self._hostile_list = hostile_list if hostile_list is not None else []
+        self._audio_manager = audio_manager
+        self._voice_enabled = voice_enabled
         # 当前所在星系名（收到"频道更换为本地"消息时更新）
         self._current_system = ""
 
@@ -117,14 +136,32 @@ class LocalMonitorService(BaseService):
             if message is None:
                 return  # 文件头、分隔线等非消息行，忽略
 
-            # ---- 第三步：系统消息 -> 检查是否切换了星系 ----
+            # ---- 第三步：系统消息 -> 星系变化 + 进出事件检测 ----
             if message.is_system:
+                # 3a) 星系变化追踪（保留原有逻辑）
                 new_system = extract_local_system(message.content)
                 if new_system is not None and new_system != self._current_system:
                     old = self._current_system or "未知"
                     self._current_system = new_system
                     self.emit_log("INFO", f"[Local] 星系变化：{old} -> {new_system}")
                     self.sig_system_changed.emit(new_system)
+
+                # 3b) 尝试解析进出星系事件（只对系统消息解析）
+                event = extract_local_event(message)
+                if event is not None:
+                    # 检查该玩家是否在敌对名单中（忽略大小写匹配）
+                    matched_hostiles = match_hostile([event.player], self._hostile_list)
+                    if matched_hostiles:
+                        # 构造预警信息
+                        action = "进入" if event.type == "enter" else "离开"
+                        alert_msg = f"[Local 敌对预警] 玩家 {event.player} {action}星系 {event.system}"
+                        # 发射预警信号（与 BaseService 同名信号同语义）
+                        self.sig_alert_triggered.emit(alert_msg)
+                        # TTS 语音播报（仅在配置启用时）
+                        if self._audio_manager is not None and self._voice_enabled:
+                            self._audio_manager.speak("本地频道发现敌对")
+                        # 记录 WARNING 级别日志
+                        self.emit_log("WARNING", alert_msg)
                 return
 
             # ---- 第四步：玩家发言 -> 发射发言信号 ----
@@ -132,3 +169,13 @@ class LocalMonitorService(BaseService):
 
         except Exception as e:  # noqa: BLE001 —— 回调禁止抛异常
             logger.error(f"Local 日志行处理异常（已拦截）：{e}")
+
+    def update_hostile_list(self, hostile_list: List[str]) -> None:
+        """
+        运行时更新敌对玩家名单。
+
+        参数：
+            hostile_list: 新的敌对玩家名单列表（会完全覆盖旧名单）
+        """
+        self._hostile_list = list(hostile_list) if hostile_list is not None else []
+        self.emit_log("INFO", f"[Local] 敌对名单已更新，共 {len(self._hostile_list)} 人")
